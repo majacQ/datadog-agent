@@ -33,6 +33,7 @@ BCC_TAG = "bcc"
 GIMME_ENV_VARS = ['GOROOT', 'PATH']
 
 DATADOG_AGENT_EMBEDDED_PATH = '/opt/datadog-agent/embedded'
+NIKOS_EMBEDDED_PATH = '/opt/nikos/embedded'
 
 KITCHEN_DIR = os.path.join("test", "kitchen")
 KITCHEN_ARTIFACT_DIR = os.path.join(KITCHEN_DIR, "site-cookbooks", "dd-system-probe-check", "files", "default", "tests")
@@ -129,14 +130,20 @@ def build(
     if bundle_ebpf:
         build_tags.append("ebpf_bindata")
 
+    build_tags.append("dnf")
+    nikos_build_flags = 'PKG_CONFIG_PATH=' + NIKOS_EMBEDDED_PATH + '/lib/pkgconfig '
+    nikos_build_flags += 'CGO_LDFLAGS="-Wl,-rpath,' + NIKOS_EMBEDDED_PATH + '/lib"'
+    nikos_omnibus_build(ctx)
+
     if with_bcc:
         build_tags.append(BCC_TAG)
 
     # TODO static option
-    cmd = 'go build -mod={go_mod} {race_opt} {build_type} -tags "{go_build_tags}" '
+    cmd = '{nikos_build_flags} go build -mod={go_mod} {race_opt} {build_type} -tags "{go_build_tags}" '
     cmd += '-o {agent_bin} -gcflags="{gcflags}" -ldflags="{ldflags}" {REPO_PATH}/cmd/system-probe'
 
     args = {
+        "nikos_build_flags": nikos_build_flags,
         "go_mod": go_mod,
         "race_opt": "-race" if race else "",
         "build_type": "" if incremental_build else "-a",
@@ -693,3 +700,23 @@ def tempdir():
         yield dirpath
     finally:
         shutil.rmtree(dirpath)
+
+def nikos_omnibus_build(ctx):
+    """
+    Build the nikos package with Omnibus Installer.
+    """
+    with ctx.cd("omnibus-nikos"):
+        # make sure bundle install starts from a clean state
+        try:
+            os.remove("Gemfile.lock")
+        except Exception:
+            pass
+
+        cmd = "bundle install"
+        ctx.run(cmd)
+
+        cmd = "bundle exec omnibus build nikos"
+        try:
+            ctx.run(cmd)
+        except Exception:
+            raise
