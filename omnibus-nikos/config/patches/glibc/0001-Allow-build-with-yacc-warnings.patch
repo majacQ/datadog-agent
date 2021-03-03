@@ -1,0 +1,25 @@
+From 9021e1ab97ec8016ebe8e4be5b33f047d8338da0 Mon Sep 17 00:00:00 2001
+From: Isabelle Sauve <isabelle.sauve@datadoghq.com>
+Date: Thu, 25 Feb 2021 04:40:13 +0000
+Subject: [PATCH] Allow-build-with-yacc-warnings
+
+---
+ intl/Makefile | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/intl/Makefile b/intl/Makefile
+index ce3072420..9959a588a 100644
+--- a/intl/Makefile
++++ b/intl/Makefile
+@@ -155,7 +155,7 @@ $(objpfx)tst-gettext6.out: $(objpfx)tst-gettext.out
+ 
+ CPPFLAGS += -D'LOCALEDIR="$(localedir)"' \
+ 	    -D'LOCALE_ALIAS_PATH="$(localedir)"'
+-BISONFLAGS = --yacc --name-prefix=__gettext --output
++BISONFLAGS = --yacc -Wno-error=yacc --name-prefix=__gettext --output
+ 
+ $(inst_localedir)/locale.alias: locale.alias $(+force)
+ 	$(do-install)
+-- 
+2.25.1
+

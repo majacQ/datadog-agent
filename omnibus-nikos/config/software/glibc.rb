@@ -23,6 +23,7 @@ skip_transitive_dependency_licensing true
 
 version("2.17") { source sha256: "80f5acd0bbc573ad80579ae98c789143c75f13fb39e4dbd2449c086774b8315c" }
 version("2.32") { source sha256: "6d34d8ba95e714dbede304dad8bf8931bf3950293f8c14ab57167ae141aad68a" }
+version("2.33") { source sha256: "4d7aa859d9152a4b243821eb604c0f1fee14c10d6341c2b9628d454cddd0f22e" }
 
 source url: "https://ftp.gnu.org/gnu/glibc/glibc-#{version}.tar.bz2"
 
@@ -39,6 +40,8 @@ build do
 
   mkdir "builddir"
   cwd = "#{project_dir}/builddir"
+
+  patch source: "0001-Allow-build-with-yacc-warnings.patch"
 
   configure_options = [
     "--enable-bind-now",
