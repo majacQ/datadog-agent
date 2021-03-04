@@ -19,7 +19,6 @@ require './lib/cmake.rb'
 name "libdnf"
 default_version "0.54.2"
 
-dependency 'glibc'
 dependency 'libmodulemd'
 dependency 'librepo'
 dependency 'libsolv'
