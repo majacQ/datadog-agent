@@ -14,6 +14,8 @@
 # limitations under the License.
 #
 
+require './lib/cmake.rb'
+
 name "zstd"
 default_version "1.4.5"
 
@@ -30,18 +32,13 @@ relative_path "zstd-#{version}"
 build do
   env = with_standard_compiler_flags(with_embedded_path)
 
-  meson_command = [
-    "meson",
-    "setup",
-    "--prefix=#{install_dir}/embedded",
-    "--libdir=lib",
-    "-Dbin_programs=false",
-    "builddir"
+  cmake_build_dir = "#{project_dir}/build/cmake/builddir"
+
+  command "mkdir #{cmake_build_dir}", env: env
+
+  cmake_options = [
+    "-DZSTD_BUILD_PROGRAMS=OFF"
   ]
 
-  meson_dir = "#{project_dir}/build/meson"
-  command meson_command.join(" "), env: env, cwd: meson_dir
-
-  command "ninja -C builddir", env: env, cwd: meson_dir
-  command "ninja -C builddir install", env: env, cwd: meson_dir
+  cmake(*cmake_options, env: env, cwd: cmake_build_dir, prefix: "#{install_dir}/embedded")
 end
