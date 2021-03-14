@@ -22,6 +22,7 @@ replace (
 // pinned to grpc v1.27.0
 replace (
 	github.com/grpc-ecosystem/grpc-gateway => github.com/grpc-ecosystem/grpc-gateway v1.12.2
+	go.etcd.io/etcd => go.etcd.io/etcd v0.5.0-alpha.5.0.20200425165423-262c93980547
 	google.golang.org/grpc => github.com/grpc/grpc-go v1.27.0
 )
 
@@ -98,7 +99,7 @@ require (
 	github.com/gogo/protobuf v1.3.1
 	github.com/golang/groupcache v0.0.0-20200121045136-8c9f03a8e57e
 	github.com/golang/mock v1.4.4
-	github.com/golang/protobuf v1.4.3
+	github.com/golang/protobuf v1.4.2
 	github.com/golangci/golangci-lint v1.27.0
 	github.com/google/gopacket v1.1.17
 	github.com/google/pprof v0.0.0-20201117184057-ae444373da19

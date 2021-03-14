@@ -42,9 +42,9 @@ relative_path "libdnf-#{version}"
 
 build do
   patch source: "0001-Fix-cmake-resolution-for-FindLibSolv.cmake.patch"
-  patch source: "0002-Only-require-smartcols-when-generating-Python-bindin.patch"
+  patch source: "0002-Only-require-smartcols-when-generating-Python-bi.patch"
   patch source: "0003-Allow-not-building-tests.patch"
-  patch source: "0004-Do-not-set-unknown-pool-flat-POOL_FLAG_WHATPROVIDESW.patch"
+  patch source: "0004-Do-not-set-unknown-pool-flat-POOL_FLAG_WHATPROVI.patch"
 
   env = with_standard_compiler_flags(with_embedded_path)
 
