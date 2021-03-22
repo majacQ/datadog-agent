@@ -455,7 +455,7 @@ func TestSubmitEventPlatformEvent(t *testing.T) {
 	// Reset memory counters
 	helpers.ResetMemoryStats()
 
-	out, err := run(`aggregator.submit_evennt_platform_event(None, 'id', 'raw-event', 'dbquery')`)
+	out, err := run(`aggregator.submit_event_platform_event(None, 'id', 'raw-event', 'dbquery')`)
 	if err != nil {
 		t.Fatal(err)
 	}

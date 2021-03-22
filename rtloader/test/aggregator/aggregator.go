@@ -233,4 +233,14 @@ func submitEventPlatformEvent(checkID *C.char, rawEvent *C.char, track *C.char, 
 	checkID = C.GoString(checkID)
 	rawEvent = C.GoString(rawEvent)
 	track = C.GoString(track)
+	switch track {
+	case "dbquery":
+		return
+	case "":
+		*errResult = (*C.char)(helpers.TrackedCString("empty track"))
+		return
+	default:
+		*errResult = (*C.char)(helpers.TrackedCString(fmt.Sprintf("unknown track: %s", track)))
+		return
+	}
 }
