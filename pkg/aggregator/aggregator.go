@@ -8,6 +8,7 @@ package aggregator
 import (
 	"expvar"
 	"fmt"
+	"github.com/DataDog/datadog-agent/pkg/logs/message"
 	"sync"
 	"time"
 
@@ -108,6 +109,8 @@ var (
 	aggregatorOrchestratorMetadata             = expvar.Int{}
 	aggregatorOrchestratorMetadataErrors       = expvar.Int{}
 	aggregatorDogstatsdContexts                = expvar.Int{}
+	aggregatorEventPlatformEvents              = expvar.Int{}
+	aggregatorEventPlatformErrors              = expvar.Int{}
 
 	tlmFlush = telemetry.NewCounter("aggregator", "flush",
 		[]string{"data_type", "state"}, "Number of metrics/service checks/events flushed")
@@ -155,6 +158,8 @@ func init() {
 	aggregatorExpvars.Set("OrchestratorMetadata", &aggregatorOrchestratorMetadata)
 	aggregatorExpvars.Set("OrchestratorMetadataErrors", &aggregatorOrchestratorMetadataErrors)
 	aggregatorExpvars.Set("DogstatsdContexts", &aggregatorDogstatsdContexts)
+	aggregatorExpvars.Set("EventPlatformEvents", &aggregatorEventPlatformEvents)
+	aggregatorExpvars.Set("EventPlatformErrors", &aggregatorEventPlatformErrors)
 }
 
 // InitAggregator returns the Singleton instance
@@ -202,26 +207,27 @@ type BufferedAggregator struct {
 	checkMetricIn          chan senderMetricSample
 	checkHistogramBucketIn chan senderHistogramBucket
 	orchestratorMetadataIn chan senderOrchestratorMetadata
+	eventPlatformIn        chan senderEventPlatformEvent
 
 	// metricSamplePool is a pool of slices of metric sample to avoid allocations.
 	// Used by the Dogstatsd Batcher.
 	MetricSamplePool *metrics.MetricSamplePool
 
-	statsdSampler      TimeSampler
-	checkSamplers      map[check.ID]*CheckSampler
-	serviceChecks      metrics.ServiceChecks
-	events             metrics.Events
-	flushInterval      time.Duration
-	mu                 sync.Mutex // to protect the checkSamplers field
-	flushMutex         sync.Mutex // to start multiple flushes in parallel
-	serializer         serializer.MetricSerializer
-	hostname           string
-	hostnameUpdate     chan string
-	hostnameUpdateDone chan struct{}    // signals that the hostname update is finished
-	TickerChan         <-chan time.Time // For test/benchmark purposes: it allows the flush to be controlled from the outside
-	stopChan           chan struct{}
-	health             *health.Handle
-	agentName          string // Name of the agent for telemetry metrics
+	statsdSampler       TimeSampler
+	checkSamplers       map[check.ID]*CheckSampler
+	serviceChecks       metrics.ServiceChecks
+	events              metrics.Events
+	flushInterval       time.Duration
+	mu                  sync.Mutex // to protect the checkSamplers field
+	flushMutex          sync.Mutex // to start multiple flushes in parallel
+	serializer          serializer.MetricSerializer
+	hostname            string
+	hostnameUpdate      chan string
+	hostnameUpdateDone  chan struct{}    // signals that the hostname update is finished
+	TickerChan          <-chan time.Time // For test/benchmark purposes: it allows the flush to be controlled from the outside
+	stopChan            chan struct{}
+	health              *health.Handle
+	agentName           string // Name of the agent for telemetry metrics
 
 	tlmContainerTagsEnabled bool                                              // Whether we should call the tagger to tag agent telemetry metrics
 	agentTags               func(collectors.TagCardinality) ([]string, error) // This function gets the agent tags from the tagger (defined as a struct field to ease testing)
@@ -257,6 +263,7 @@ func NewBufferedAggregator(s serializer.MetricSerializer, hostname string, flush
 		checkHistogramBucketIn: make(chan senderHistogramBucket, bufferSize),
 
 		orchestratorMetadataIn: make(chan senderOrchestratorMetadata, bufferSize),
+		eventPlatformIn:        make(chan senderEventPlatformEvent, bufferSize),
 
 		MetricSamplePool: metrics.NewMetricSamplePool(MetricSamplePoolBatchSize),
 
@@ -287,7 +294,7 @@ func AddRecurrentSeries(newSerie *metrics.Serie) {
 // IsInputQueueEmpty returns true if every input channel for the aggregator are
 // empty. This is mainly useful for tests and benchmark
 func (agg *BufferedAggregator) IsInputQueueEmpty() bool {
-	if len(agg.checkMetricIn)+len(agg.serviceCheckIn)+len(agg.eventIn)+len(agg.checkHistogramBucketIn) == 0 {
+	if len(agg.checkMetricIn)+len(agg.serviceCheckIn)+len(agg.eventIn)+len(agg.checkHistogramBucketIn)+len(agg.eventPlatformIn) == 0 {
 		return true
 	}
 	return false
@@ -765,6 +772,19 @@ func (agg *BufferedAggregator) run() {
 					log.Errorf("Error submitting orchestrator data: %s", err)
 				}
 			}(orchestratorMetadata)
+		case event := <-agg.eventPlatformIn:
+			aggregatorEventPlatformEvents.Add(1)
+			err := agg.serializer.SendEventPlatformEvent(&message.Message{
+				Content:            []byte(event.rawEvent),
+				Origin:             nil,
+				IngestionTimestamp: 0,
+				Timestamp:          time.Time{},
+				Lambda:             nil,
+			}, event.track)
+			if err != nil {
+				aggregatorEventPlatformErrors.Add(1)
+				log.Errorf("Error submitting event platform event data: %s", err)
+			}
 		}
 
 	}

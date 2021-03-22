@@ -10,6 +10,7 @@ package common
 import (
 	"context"
 	"encoding/json"
+	epforwarder "github.com/DataDog/datadog-agent/pkg/logs/forwarder"
 	"net/http"
 	"path/filepath"
 
@@ -38,6 +39,9 @@ var (
 
 	// Forwarder is the global forwarder instance
 	Forwarder forwarder.Forwarder
+
+	// EventPlatformForwarder is the global event platform forwarder instance
+	EventPlatformForwarder epforwarder.EventPlatformForwarder
 
 	// MainCtx is the main agent context passed to components
 	MainCtx context.Context

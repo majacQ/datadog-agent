@@ -35,6 +35,7 @@ type Sender interface {
 	ServiceCheck(checkName string, status metrics.ServiceCheckStatus, hostname string, tags []string, message string)
 	HistogramBucket(metric string, value int64, lowerBound, upperBound float64, monotonic bool, hostname string, tags []string)
 	Event(e metrics.Event)
+	EventPlatformEvent(rawEvent string, track string) error
 	GetMetricStats() map[string]int64
 	DisableDefaultHostname(disable bool)
 	SetCheckCustomTags(tags []string)
@@ -70,6 +71,7 @@ type checkSender struct {
 	eventOut                chan<- metrics.Event
 	histogramBucketOut      chan<- senderHistogramBucket
 	orchestratorOut         chan<- senderOrchestratorMetadata
+	eventPlatformOut        chan<- senderEventPlatformEvent
 	checkTags               []string
 	service                 string
 }
@@ -83,6 +85,12 @@ type senderMetricSample struct {
 type senderHistogramBucket struct {
 	id     check.ID
 	bucket *metrics.HistogramBucket
+}
+
+type senderEventPlatformEvent struct {
+	id       check.ID
+	rawEvent string
+	track    string
 }
 
 type senderOrchestratorMetadata struct {
@@ -102,7 +110,7 @@ func init() {
 	}
 }
 
-func newCheckSender(id check.ID, defaultHostname string, smsOut chan<- senderMetricSample, serviceCheckOut chan<- metrics.ServiceCheck, eventOut chan<- metrics.Event, bucketOut chan<- senderHistogramBucket, orchestratorOut chan<- senderOrchestratorMetadata) *checkSender {
+func newCheckSender(id check.ID, defaultHostname string, smsOut chan<- senderMetricSample, serviceCheckOut chan<- metrics.ServiceCheck, eventOut chan<- metrics.Event, bucketOut chan<- senderHistogramBucket, orchestratorOut chan<- senderOrchestratorMetadata, eventPlatformOut chan<- senderEventPlatformEvent) *checkSender {
 	return &checkSender{
 		id:                 id,
 		defaultHostname:    defaultHostname,
@@ -113,6 +121,7 @@ func newCheckSender(id check.ID, defaultHostname string, smsOut chan<- senderMet
 		priormetricStats:   metricStats{},
 		histogramBucketOut: bucketOut,
 		orchestratorOut:    orchestratorOut,
+		eventPlatformOut:   eventPlatformOut,
 	}
 }
 
@@ -155,7 +164,7 @@ func GetDefaultSender() (Sender, error) {
 	senderInit.Do(func() {
 		var defaultCheckID check.ID                       // the default value is the zero value
 		aggregatorInstance.registerSender(defaultCheckID) //nolint:errcheck
-		senderInstance = newCheckSender(defaultCheckID, aggregatorInstance.hostname, aggregatorInstance.checkMetricIn, aggregatorInstance.serviceCheckIn, aggregatorInstance.eventIn, aggregatorInstance.checkHistogramBucketIn, aggregatorInstance.orchestratorMetadataIn)
+		senderInstance = newCheckSender(defaultCheckID, aggregatorInstance.hostname, aggregatorInstance.checkMetricIn, aggregatorInstance.serviceCheckIn, aggregatorInstance.eventIn, aggregatorInstance.checkHistogramBucketIn, aggregatorInstance.orchestratorMetadataIn, aggregatorInstance.eventPlatformIn)
 	})
 
 	return senderInstance, nil
@@ -392,6 +401,17 @@ func (s *checkSender) Event(e metrics.Event) {
 	s.metricStats.Lock.Unlock()
 }
 
+// Event submits an event
+func (s *checkSender) EventPlatformEvent(rawEvent string, track string) error {
+	// TODO: validate on supported tracks
+	s.eventPlatformOut <- senderEventPlatformEvent{
+		id:       s.id,
+		rawEvent: rawEvent,
+		track:    track,
+	}
+	return nil
+}
+
 // OrchestratorMetadata submit orchestrator metadata messages
 func (s *checkSender) OrchestratorMetadata(msgs []serializer.ProcessMessageBody, clusterID, payloadType string) {
 	om := senderOrchestratorMetadata{
@@ -430,7 +450,7 @@ func (sp *checkSenderPool) mkSender(id check.ID) (Sender, error) {
 	defer sp.m.Unlock()
 
 	err := aggregatorInstance.registerSender(id)
-	sender := newCheckSender(id, aggregatorInstance.hostname, aggregatorInstance.checkMetricIn, aggregatorInstance.serviceCheckIn, aggregatorInstance.eventIn, aggregatorInstance.checkHistogramBucketIn, aggregatorInstance.orchestratorMetadataIn)
+	sender := newCheckSender(id, aggregatorInstance.hostname, aggregatorInstance.checkMetricIn, aggregatorInstance.serviceCheckIn, aggregatorInstance.eventIn, aggregatorInstance.checkHistogramBucketIn, aggregatorInstance.orchestratorMetadataIn, aggregatorInstance.eventPlatformIn)
 	sp.senders[id] = sender
 	return sender, err
 }

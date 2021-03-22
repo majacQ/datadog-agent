@@ -450,3 +450,20 @@ func TestSubmitHistogramBucket(t *testing.T) {
 	// Check for leaks
 	helpers.AssertMemoryUsage(t)
 }
+
+func TestSubmitEventPlatformEvent(t *testing.T) {
+	// Reset memory counters
+	helpers.ResetMemoryStats()
+
+	out, err := run(`aggregator.submit_evennt_platform_event(None, 'id', 'raw-event', 'dbquery')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if out != "" {
+		t.Errorf("Unexpected printed value: '%s'", out)
+	}
+
+	// Check for leaks
+	helpers.AssertMemoryUsage(t)
+}

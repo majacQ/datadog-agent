@@ -21,12 +21,14 @@ extern void submitMetric(char *, metric_type_t, char *, double, char **, char *,
 extern void submitServiceCheck(char *, char *, int, char **, char *, char *);
 extern void submitEvent(char*, event_t*);
 extern void submitHistogramBucket(char *, char *, long long, float, float, int, char *, char **);
+extern void submitEventPlatformEvent(char *, char *, char *, char **);
 
 static void initAggregatorTests(rtloader_t *rtloader) {
    set_submit_metric_cb(rtloader, submitMetric);
    set_submit_service_check_cb(rtloader, submitServiceCheck);
    set_submit_event_cb(rtloader, submitEvent);
    set_submit_histogram_bucket_cb(rtloader, submitHistogramBucket);
+   set_submit_event_platform_event_cb(rtloader, submitEventPlatformEvent);
 }
 */
 import "C"
@@ -224,4 +226,11 @@ func submitHistogramBucket(id *C.char, cMetricName *C.char, cVal C.longlong, cLo
 	if t != nil {
 		tags = append(tags, charArrayToSlice(t)...)
 	}
+}
+
+//export submitEventPlatformEvent
+func submitEventPlatformEvent(checkID *C.char, rawEvent *C.char, track *C.char, errResult **C.char) {
+	checkID = C.GoString(checkID)
+	rawEvent = C.GoString(rawEvent)
+	track = C.GoString(track)
 }

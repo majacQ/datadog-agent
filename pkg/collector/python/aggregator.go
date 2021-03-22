@@ -131,3 +131,26 @@ func SubmitHistogramBucket(checkID *C.char, metricName *C.char, value C.longlong
 
 	sender.HistogramBucket(_name, _value, _lowerBound, _upperBound, _monotonic, _hostname, _tags)
 }
+
+// SubmitEventPlatformEvent is the method exposed to Python scripts to submit event platform events
+// TODO: should we expose message level (i.e. INFO/WARN/ERROR)?
+//export SubmitEventPlatformEvent
+func SubmitEventPlatformEvent(checkID *C.char, rawEvent *C.char, track *C.char, errResult **C.char) {
+	_checkID := C.GoString(checkID)
+	sender, err := aggregator.GetSender(chk.ID(_checkID))
+	if err != nil || sender == nil {
+		log.Errorf("Error submitting event platform event to the Sender: %v", err)
+		// TODO: should communiate error back to caller? Maybe not.
+		return
+	}
+
+	_rawEvent := C.GoString(rawEvent)
+	_track := C.GoString(track)
+
+	err = sender.EventPlatformEvent(_rawEvent, _track)
+	if err != nil {
+		// main error that would be useful to send back to check is "invalid track"
+		*errResult = (*C.char)(TrackedCString(err.Error()))
+	}
+	return
+}

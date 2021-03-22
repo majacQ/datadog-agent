@@ -10,6 +10,8 @@ import (
 	"errors"
 	"expvar"
 	"fmt"
+	epforwarder "github.com/DataDog/datadog-agent/pkg/logs/forwarder"
+	"github.com/DataDog/datadog-agent/pkg/logs/message"
 	"net/http"
 	"strconv"
 	"time"
@@ -99,12 +101,14 @@ type MetricSerializer interface {
 	SendHostMetadata(m marshaler.Marshaler) error
 	SendJSONToV1Intake(data interface{}) error
 	SendOrchestratorMetadata(msgs []ProcessMessageBody, hostName, clusterID, payloadType string) error
+	SendEventPlatformEvent(e *message.Message, track string) error
 }
 
 // Serializer serializes metrics to the correct format and routes the payloads to the correct endpoint in the Forwarder
 type Serializer struct {
-	Forwarder             forwarder.Forwarder
-	orchestratorForwarder forwarder.Forwarder
+	Forwarder              forwarder.Forwarder
+	orchestratorForwarder  forwarder.Forwarder
+	eventPlatformForwarder epforwarder.EventPlatformForwarder
 
 	seriesJSONPayloadBuilder *stream.JSONPayloadBuilder
 
@@ -126,10 +130,11 @@ type Serializer struct {
 }
 
 // NewSerializer returns a new Serializer initialized
-func NewSerializer(forwarder forwarder.Forwarder, orchestratorForwarder forwarder.Forwarder) *Serializer {
+func NewSerializer(forwarder forwarder.Forwarder, orchestratorForwarder forwarder.Forwarder, eventPlatformForwarder epforwarder.EventPlatformForwarder) *Serializer {
 	s := &Serializer{
 		Forwarder:                     forwarder,
 		orchestratorForwarder:         orchestratorForwarder,
+		eventPlatformForwarder:        eventPlatformForwarder,
 		seriesJSONPayloadBuilder:      stream.NewJSONPayloadBuilder(config.Datadog.GetBool("enable_json_stream_shared_compressor_buffers")),
 		enableEvents:                  config.Datadog.GetBool("enable_payloads.events"),
 		enableSeries:                  config.Datadog.GetBool("enable_payloads.series"),
@@ -425,4 +430,11 @@ func (s *Serializer) SendOrchestratorMetadata(msgs []ProcessMessageBody, hostNam
 		}
 	}
 	return nil
+}
+
+func (s *Serializer) SendEventPlatformEvent(e *message.Message, track string) error {
+	if s.eventPlatformForwarder == nil {
+		return errors.New("event platform forwarder is not setup")
+	}
+	return s.eventPlatformForwarder.SendEventPlatformEvent(e, track)
 }

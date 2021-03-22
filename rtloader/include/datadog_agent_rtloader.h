@@ -1,3 +1,4 @@
+
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog
@@ -392,6 +393,15 @@ DATADOG_AGENT_RTLOADER_API void set_submit_event_cb(rtloader_t *, cb_submit_even
     The callback is expected to be provided by the rtloader caller - in go-context: CGO.
 */
 DATADOG_AGENT_RTLOADER_API void set_submit_histogram_bucket_cb(rtloader_t *, cb_submit_histogram_bucket_t);
+
+/*! \fn void set_submit_event_platform_event_cb(rtloader_t *, cb_submit_event_platform_event_t)
+    \brief Sets the submit event callback to be used by rtloader for histogram bucket submission.
+    \param cb A function pointer with cb_submit_event_platform_event_t prototype to the callback
+    function.
+
+    The callback is expected to be provided by the rtloader caller - in go-context: CGO.
+*/
+DATADOG_AGENT_RTLOADER_API void set_submit_event_platform_event_cb(rtloader_t *, cb_submit_event_platform_event_t);
 
 // DATADOG_AGENT API
 /*! \fn void set_get_version_cb(rtloader_t *, cb_get_version_t)
