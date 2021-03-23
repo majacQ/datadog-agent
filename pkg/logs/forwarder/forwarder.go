@@ -4,11 +4,11 @@ import (
 	"fmt"
 	"github.com/DataDog/datadog-agent/pkg/logs/auditor"
 	"github.com/DataDog/datadog-agent/pkg/logs/client"
+	"github.com/DataDog/datadog-agent/pkg/logs/client/http"
 	"github.com/DataDog/datadog-agent/pkg/logs/config"
-	"github.com/DataDog/datadog-agent/pkg/logs/diagnostic"
 	"github.com/DataDog/datadog-agent/pkg/logs/message"
-	"github.com/DataDog/datadog-agent/pkg/logs/pipeline"
 	"github.com/DataDog/datadog-agent/pkg/logs/restart"
+	"github.com/DataDog/datadog-agent/pkg/logs/sender"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
@@ -23,29 +23,30 @@ type EventPlatformForwarder interface {
 }
 
 type DefaultEventPlatformForwarder struct {
-	providers       []pipeline.Provider
-	trackChans      map[string]chan *message.Message
+	pipelines       map[string]*PassthroughPipeline
 	destinationsCtx *client.DestinationsContext
 }
 
 func (s *DefaultEventPlatformForwarder) SendEventPlatformEvent(e *message.Message, track string) error {
-	c, ok := s.trackChans[track]
+	p, ok := s.pipelines[track]
 	if !ok {
 		return fmt.Errorf("track does not exist: %s", track)
 	}
-	c <- e
+	// TODO: should this be non-blocking write to avoid blocking the whole aggregator?
+	p.in <- e
 	return nil
 }
 
 func (s *DefaultEventPlatformForwarder) Start() {
-	for _, p := range s.providers {
+	s.destinationsCtx.Start()
+	for _, p := range s.pipelines {
 		p.Start()
 	}
 }
 
 func (s *DefaultEventPlatformForwarder) Stop() {
 	stopper := restart.NewParallelStopper()
-	for _, p := range s.providers {
+	for _, p := range s.pipelines {
 		stopper.Add(p)
 	}
 	stopper.Stop()
@@ -53,7 +54,45 @@ func (s *DefaultEventPlatformForwarder) Stop() {
 	s.destinationsCtx.Stop()
 }
 
-func newDbQueryPipeline(destinationsContext *client.DestinationsContext) (pipeline.Provider, error) {
+type PassthroughPipeline struct {
+	// TODO: do we need to parallelize sending? If a single agent has some massive number of checks is this necessary?
+	sender  *sender.Sender
+	in      chan *message.Message
+	auditor auditor.Auditor
+}
+
+func NewHTTPPassthroughPipeline(endpoints *config.Endpoints, destinationsContext *client.DestinationsContext) (p *PassthroughPipeline, err error) {
+	if !endpoints.UseHTTP {
+		return p, fmt.Errorf("endpoints must be http")
+	}
+	main := http.NewDestination(endpoints.Main, http.JSONContentType, destinationsContext)
+	additionals := []client.Destination{}
+	for _, endpoint := range endpoints.Additionals {
+		additionals = append(additionals, http.NewDestination(endpoint, http.JSONContentType, destinationsContext))
+	}
+	destinations := client.NewDestinations(main, additionals)
+	inputChan := make(chan *message.Message, config.ChanSize)
+	strategy := sender.NewBatchStrategy(sender.ArraySerializer, endpoints.BatchWait)
+	a := auditor.NewNullAuditor()
+	return &PassthroughPipeline{
+		sender:  sender.NewSender(inputChan, a.Channel(), destinations, strategy),
+		in:      inputChan,
+		auditor: a,
+	}, nil
+}
+
+func (p *PassthroughPipeline) Start() {
+	p.auditor.Start()
+	p.sender.Start()
+}
+
+
+func (p *PassthroughPipeline) Stop() {
+	p.sender.Stop()
+	p.auditor.Stop()
+}
+
+func newDbQueryPipeline(destinationsContext *client.DestinationsContext) (*PassthroughPipeline, error) {
 	configKeys := config.LogsConfigKeys{
 		CompressionLevel:        "database_monitoring.compression_level",
 		ConnectionResetInterval: "database_monitoring.connection_reset_interval",
@@ -67,26 +106,20 @@ func newDbQueryPipeline(destinationsContext *client.DestinationsContext) (pipeli
 	if err != nil {
 		return nil, err
 	}
-
-	provider := pipeline.NewProvider(1, auditor.NewNullAuditor(), &diagnostic.NoopMessageReceiver{}, nil, endpoints, destinationsContext)
-
-	return provider, nil
+	return NewHTTPPassthroughPipeline(endpoints, destinationsContext)
 }
 
 func NewEventPlatformForwarder() EventPlatformForwarder {
-	var pipelines []pipeline.Provider
-	trackChans := make(map[string]chan *message.Message)
-
 	destinationsCtx := client.NewDestinationsContext()
 	destinationsCtx.Start()
+	pipelines := make(map[string]*PassthroughPipeline)
 
 	// dbquery
 	p, err := newDbQueryPipeline(destinationsCtx)
 	if err != nil {
 		log.Errorf("Failed to initialize dbquery event pipeline: %s", err)
 	} else {
-		trackChans[DbQueryTrackID] = p.NextPipelineChan()
-		pipelines = append(pipelines, p)
+		pipelines[DbQueryTrackID] = p
 		log.Debugf("Initialized event platform forwarder pipeline. track=%s", DbQueryTrackID)
 	}
 
@@ -94,7 +127,7 @@ func NewEventPlatformForwarder() EventPlatformForwarder {
 	// TODO
 
 	return &DefaultEventPlatformForwarder{
-		trackChans:      trackChans,
+		pipelines:      pipelines,
 		destinationsCtx: destinationsCtx,
 	}
 }

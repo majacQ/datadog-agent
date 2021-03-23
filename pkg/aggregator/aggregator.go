@@ -207,6 +207,7 @@ type BufferedAggregator struct {
 	checkMetricIn          chan senderMetricSample
 	checkHistogramBucketIn chan senderHistogramBucket
 	orchestratorMetadataIn chan senderOrchestratorMetadata
+	// TODO: new chan per sender?
 	eventPlatformIn        chan senderEventPlatformEvent
 
 	// metricSamplePool is a pool of slices of metric sample to avoid allocations.
@@ -774,9 +775,12 @@ func (agg *BufferedAggregator) run() {
 			}(orchestratorMetadata)
 		case event := <-agg.eventPlatformIn:
 			aggregatorEventPlatformEvents.Add(1)
+			// TODO: should this be non-blocking write to avoid blocking the whole aggregator if it's full
 			err := agg.serializer.SendEventPlatformEvent(&message.Message{
 				Content:            []byte(event.rawEvent),
+				// TODO: add origin info
 				Origin:             nil,
+				// TODO: deal with timestamps
 				IngestionTimestamp: 0,
 				Timestamp:          time.Time{},
 				Lambda:             nil,

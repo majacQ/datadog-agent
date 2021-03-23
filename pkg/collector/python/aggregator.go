@@ -149,7 +149,6 @@ func SubmitEventPlatformEvent(checkID *C.char, rawEvent *C.char, track *C.char, 
 
 	err = sender.EventPlatformEvent(_rawEvent, _track)
 	if err != nil {
-		// main error that would be useful to send back to check is "invalid track"
 		*errResult = (*C.char)(TrackedCString(err.Error()))
 	}
 	return
