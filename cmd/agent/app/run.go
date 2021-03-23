@@ -346,7 +346,7 @@ func StartAgent() error {
 		orchestratorForwarder.Start() //nolint:errcheck
 	}
 
-	common.EventPlatformForwarder = epforwarder.NewEventPlatformForwarder()
+	common.EventPlatformForwarder = epforwarder.NewEventPlatformForwarder(false)
 	if common.EventPlatformForwarder != nil {
 		common.EventPlatformForwarder.Start()
 	}

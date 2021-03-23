@@ -61,7 +61,7 @@ type PassthroughPipeline struct {
 	auditor auditor.Auditor
 }
 
-func NewHTTPPassthroughPipeline(endpoints *config.Endpoints, destinationsContext *client.DestinationsContext) (p *PassthroughPipeline, err error) {
+func NewHTTPPassthroughPipeline(endpoints *config.Endpoints, destinationsContext *client.DestinationsContext, streaming bool) (p *PassthroughPipeline, err error) {
 	if !endpoints.UseHTTP {
 		return p, fmt.Errorf("endpoints must be http")
 	}
@@ -72,7 +72,12 @@ func NewHTTPPassthroughPipeline(endpoints *config.Endpoints, destinationsContext
 	}
 	destinations := client.NewDestinations(main, additionals)
 	inputChan := make(chan *message.Message, config.ChanSize)
-	strategy := sender.NewBatchStrategy(sender.ArraySerializer, endpoints.BatchWait)
+	var strategy sender.Strategy
+	if streaming {
+		strategy = sender.NewBatchStrategy(sender.ArraySerializer, endpoints.BatchWait)
+	} else {
+		strategy = sender.StreamStrategy
+	}
 	a := auditor.NewNullAuditor()
 	return &PassthroughPipeline{
 		sender:  sender.NewSender(inputChan, a.Channel(), destinations, strategy),
@@ -92,7 +97,7 @@ func (p *PassthroughPipeline) Stop() {
 	p.auditor.Stop()
 }
 
-func newDbQueryPipeline(destinationsContext *client.DestinationsContext) (*PassthroughPipeline, error) {
+func newDbQueryPipeline(destinationsContext *client.DestinationsContext, streaming bool) (*PassthroughPipeline, error) {
 	configKeys := config.LogsConfigKeys{
 		CompressionLevel:        "database_monitoring.compression_level",
 		ConnectionResetInterval: "database_monitoring.connection_reset_interval",
@@ -106,16 +111,16 @@ func newDbQueryPipeline(destinationsContext *client.DestinationsContext) (*Passt
 	if err != nil {
 		return nil, err
 	}
-	return NewHTTPPassthroughPipeline(endpoints, destinationsContext)
+	return NewHTTPPassthroughPipeline(endpoints, destinationsContext, streaming)
 }
 
-func NewEventPlatformForwarder() EventPlatformForwarder {
+func NewEventPlatformForwarder(streaming bool) EventPlatformForwarder {
 	destinationsCtx := client.NewDestinationsContext()
 	destinationsCtx.Start()
 	pipelines := make(map[string]*PassthroughPipeline)
 
 	// dbquery
-	p, err := newDbQueryPipeline(destinationsCtx)
+	p, err := newDbQueryPipeline(destinationsCtx, streaming)
 	if err != nil {
 		log.Errorf("Failed to initialize dbquery event pipeline: %s", err)
 	} else {

@@ -460,20 +460,12 @@ func TestSubmitEventPlatformEvent(t *testing.T) {
 		expectedOut string
 	}{
 		{
-			"None, 'id', '', 'dev-track'",
-			"",
-		},
-		{
 			"None, 'id', 'raw-event', 'dev-track'",
 			"",
 		},
 		{
-			"None, 'id', 'raw-event', ''",
-			"RuntimeError: invalid track: \"\"",
-		},
-		{
-			"None, 'id', 'raw-event', 'fake-track'",
-			"RuntimeError: unknown track: \"fake-track\"",
+			"None, 'id', '', ''",
+			"",
 		},
 		{
 			"None, 'id', 'raw-event', 1",

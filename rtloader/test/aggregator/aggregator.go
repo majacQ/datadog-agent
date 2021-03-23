@@ -21,7 +21,7 @@ extern void submitMetric(char *, metric_type_t, char *, double, char **, char *,
 extern void submitServiceCheck(char *, char *, int, char **, char *, char *);
 extern void submitEvent(char*, event_t*);
 extern void submitHistogramBucket(char *, char *, long long, float, float, int, char *, char **);
-extern void submitEventPlatformEvent(char *, char *, char *, char **);
+extern void submitEventPlatformEvent(char *, char *, char *);
 
 static void initAggregatorTests(rtloader_t *rtloader) {
    set_submit_metric_cb(rtloader, submitMetric);
@@ -231,18 +231,12 @@ func submitHistogramBucket(id *C.char, cMetricName *C.char, cVal C.longlong, cLo
 }
 
 //export submitEventPlatformEvent
-func submitEventPlatformEvent(id *C.char, _rawEvent *C.char, _track *C.char, errResult **C.char) {
+func submitEventPlatformEvent(id *C.char, _rawEvent *C.char, _track *C.char) {
 	checkID = C.GoString(id)
 	rawEvent = C.GoString(_rawEvent)
 	track = C.GoString(_track)
 	switch track {
 	case "dev-track":
-		return
-	case "":
-		*errResult = (*C.char)(helpers.TrackedCString("invalid track: \"\""))
-		return
-	default:
-		*errResult = (*C.char)(helpers.TrackedCString(fmt.Sprintf("unknown track: \"%s\"", track)))
 		return
 	}
 }

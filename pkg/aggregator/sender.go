@@ -35,7 +35,7 @@ type Sender interface {
 	ServiceCheck(checkName string, status metrics.ServiceCheckStatus, hostname string, tags []string, message string)
 	HistogramBucket(metric string, value int64, lowerBound, upperBound float64, monotonic bool, hostname string, tags []string)
 	Event(e metrics.Event)
-	EventPlatformEvent(rawEvent string, track string) error
+	EventPlatformEvent(rawEvent string, track string)
 	GetMetricStats() map[string]int64
 	DisableDefaultHostname(disable bool)
 	SetCheckCustomTags(tags []string)
@@ -71,7 +71,7 @@ type checkSender struct {
 	eventOut                chan<- metrics.Event
 	histogramBucketOut      chan<- senderHistogramBucket
 	orchestratorOut         chan<- senderOrchestratorMetadata
-	eventPlatformOut        chan<- senderEventPlatformEvent
+	eventPlatformOut        chan<- SenderEventPlatformEvent
 	checkTags               []string
 	service                 string
 }
@@ -87,10 +87,11 @@ type senderHistogramBucket struct {
 	bucket *metrics.HistogramBucket
 }
 
-type senderEventPlatformEvent struct {
-	id       check.ID
-	rawEvent string
-	track    string
+type SenderEventPlatformEvent struct {
+	Id                check.ID
+	RawEvent          string `json:",omitempty"`
+	Track             string
+	UnmarshalledEvent map[string]interface{} `json:",omitempty"`
 }
 
 type senderOrchestratorMetadata struct {
@@ -110,7 +111,7 @@ func init() {
 	}
 }
 
-func newCheckSender(id check.ID, defaultHostname string, smsOut chan<- senderMetricSample, serviceCheckOut chan<- metrics.ServiceCheck, eventOut chan<- metrics.Event, bucketOut chan<- senderHistogramBucket, orchestratorOut chan<- senderOrchestratorMetadata, eventPlatformOut chan<- senderEventPlatformEvent) *checkSender {
+func newCheckSender(id check.ID, defaultHostname string, smsOut chan<- senderMetricSample, serviceCheckOut chan<- metrics.ServiceCheck, eventOut chan<- metrics.Event, bucketOut chan<- senderHistogramBucket, orchestratorOut chan<- senderOrchestratorMetadata, eventPlatformOut chan<- SenderEventPlatformEvent) *checkSender {
 	return &checkSender{
 		id:                 id,
 		defaultHostname:    defaultHostname,
@@ -402,14 +403,12 @@ func (s *checkSender) Event(e metrics.Event) {
 }
 
 // Event submits an event
-func (s *checkSender) EventPlatformEvent(rawEvent string, track string) error {
-	// TODO: validate on supported tracks
-	s.eventPlatformOut <- senderEventPlatformEvent{
-		id:       s.id,
-		rawEvent: rawEvent,
-		track:    track,
+func (s *checkSender) EventPlatformEvent(rawEvent string, track string) {
+	s.eventPlatformOut <- SenderEventPlatformEvent{
+		Id:       s.id,
+		RawEvent: rawEvent,
+		Track:    track,
 	}
-	return nil
 }
 
 // OrchestratorMetadata submit orchestrator metadata messages

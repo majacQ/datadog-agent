@@ -207,8 +207,7 @@ type BufferedAggregator struct {
 	checkMetricIn          chan senderMetricSample
 	checkHistogramBucketIn chan senderHistogramBucket
 	orchestratorMetadataIn chan senderOrchestratorMetadata
-	// TODO: new chan per sender?
-	eventPlatformIn        chan senderEventPlatformEvent
+	eventPlatformIn        chan SenderEventPlatformEvent
 
 	// metricSamplePool is a pool of slices of metric sample to avoid allocations.
 	// Used by the Dogstatsd Batcher.
@@ -218,6 +217,7 @@ type BufferedAggregator struct {
 	checkSamplers       map[check.ID]*CheckSampler
 	serviceChecks       metrics.ServiceChecks
 	events              metrics.Events
+	eventPlatformEvents []SenderEventPlatformEvent
 	flushInterval       time.Duration
 	mu                  sync.Mutex // to protect the checkSamplers field
 	flushMutex          sync.Mutex // to start multiple flushes in parallel
@@ -264,7 +264,7 @@ func NewBufferedAggregator(s serializer.MetricSerializer, hostname string, flush
 		checkHistogramBucketIn: make(chan senderHistogramBucket, bufferSize),
 
 		orchestratorMetadataIn: make(chan senderOrchestratorMetadata, bufferSize),
-		eventPlatformIn:        make(chan senderEventPlatformEvent, bufferSize),
+		eventPlatformIn:        make(chan SenderEventPlatformEvent, bufferSize),
 
 		MetricSamplePool: metrics.NewMetricSamplePool(MetricSamplePoolBatchSize),
 
@@ -615,6 +615,15 @@ func (agg *BufferedAggregator) GetEvents() metrics.Events {
 	return events
 }
 
+func (agg *BufferedAggregator) GetEventPlatformEvents() []SenderEventPlatformEvent {
+	agg.mu.Lock()
+	defer agg.mu.Unlock()
+	events := agg.eventPlatformEvents
+	agg.eventPlatformEvents = nil
+	return events
+}
+
+
 func (agg *BufferedAggregator) sendEvents(start time.Time, events metrics.Events) {
 	log.Debugf("Flushing %d events to the forwarder", len(events))
 	err := agg.serializer.SendEvents(events)
@@ -776,18 +785,15 @@ func (agg *BufferedAggregator) run() {
 		case event := <-agg.eventPlatformIn:
 			aggregatorEventPlatformEvents.Add(1)
 			// TODO: should this be non-blocking write to avoid blocking the whole aggregator if it's full
-			err := agg.serializer.SendEventPlatformEvent(&message.Message{
-				Content:            []byte(event.rawEvent),
-				// TODO: add origin info
-				Origin:             nil,
-				// TODO: deal with timestamps
-				IngestionTimestamp: 0,
-				Timestamp:          time.Time{},
-				Lambda:             nil,
-			}, event.track)
+			m := &message.Message{Content: []byte(event.RawEvent)}
+			err := agg.serializer.SendEventPlatformEvent(m, event.Track)
 			if err != nil {
 				aggregatorEventPlatformErrors.Add(1)
 				log.Errorf("Error submitting event platform event data: %s", err)
+			}
+			// buffer only in the case where there is no flushing, which happens only during check runs
+			if agg.flushInterval == 0 {
+				agg.eventPlatformEvents = append(agg.eventPlatformEvents, event)
 			}
 		}
 

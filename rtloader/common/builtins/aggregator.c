@@ -426,24 +426,16 @@ static PyObject *submit_event_platform_event(PyObject *self, PyObject *args)
     char *check_id = NULL;
     char *raw_event = NULL;
     char *track = NULL;
-    char *error_message = NULL;
 
     if (!PyArg_ParseTuple(args, "Osss", &check, &check_id, &raw_event, &track)) {
         goto error;
     }
 
-    cb_submit_event_platform_event(check_id, raw_event, track, &error_message);
-
-    if (error_message != NULL) {
-        PyErr_SetString(PyExc_RuntimeError, error_message);
-        goto error;
-    }
-
+    cb_submit_event_platform_event(check_id, raw_event, track);
     PyGILState_Release(gstate);
     Py_RETURN_NONE;
 
 error:
-    _free(error_message);
     PyGILState_Release(gstate);
     return NULL;
 }
