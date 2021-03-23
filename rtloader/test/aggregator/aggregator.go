@@ -45,6 +45,8 @@ var (
 	scLevel         int
 	scName          string
 	scMessage       string
+	rawEvent        string
+	track           string
 	_event          *event
 	intValue        int
 	lowerBound      float64
@@ -229,18 +231,18 @@ func submitHistogramBucket(id *C.char, cMetricName *C.char, cVal C.longlong, cLo
 }
 
 //export submitEventPlatformEvent
-func submitEventPlatformEvent(checkID *C.char, rawEvent *C.char, track *C.char, errResult **C.char) {
-	checkID = C.GoString(checkID)
-	rawEvent = C.GoString(rawEvent)
-	track = C.GoString(track)
+func submitEventPlatformEvent(id *C.char, _rawEvent *C.char, _track *C.char, errResult **C.char) {
+	checkID = C.GoString(id)
+	rawEvent = C.GoString(_rawEvent)
+	track = C.GoString(_track)
 	switch track {
-	case "dbquery":
+	case "dev-track":
 		return
 	case "":
-		*errResult = (*C.char)(helpers.TrackedCString("empty track"))
+		*errResult = (*C.char)(helpers.TrackedCString("invalid track: \"\""))
 		return
 	default:
-		*errResult = (*C.char)(helpers.TrackedCString(fmt.Sprintf("unknown track: %s", track)))
+		*errResult = (*C.char)(helpers.TrackedCString(fmt.Sprintf("unknown track: \"%s\"", track)))
 		return
 	}
 }

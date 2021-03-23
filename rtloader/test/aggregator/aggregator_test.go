@@ -455,13 +455,36 @@ func TestSubmitEventPlatformEvent(t *testing.T) {
 	// Reset memory counters
 	helpers.ResetMemoryStats()
 
-	out, err := run(`aggregator.submit_event_platform_event(None, 'id', 'raw-event', 'dbquery')`)
-	if err != nil {
-		t.Fatal(err)
+	cases := []struct {
+		args        string
+		expectedOut string
+	}{
+		{
+			"None, 'id', 'raw-event', 'dev-track'",
+			"",
+		},
+		{
+			"None, 'id', 'raw-event', ''",
+			"RuntimeError: invalid track: \"\"",
+		},
+		{
+			"None, 'id', 'raw-event', 'fake-track'",
+			"RuntimeError: unknown track: \"fake-track\"",
+		},
+		{
+			"None, 'id', 'raw-event', 1",
+			"TypeError: argument 4 must be str, not int",
+		},
 	}
 
-	if out != "" {
-		t.Errorf("Unexpected printed value: '%s'", out)
+	for _, testCase := range cases {
+		out, err := run(fmt.Sprintf("aggregator.submit_event_platform_event(%s)", testCase.args))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out != testCase.expectedOut {
+			t.Fatalf("wrong output. expected='%s', found='%s'", testCase.expectedOut, out)
+		}
 	}
 
 	// Check for leaks
