@@ -354,11 +354,19 @@ func (p *Probe) handleEvent(CPU uint64, data []byte) {
 		}
 
 		// Resolve mount point
-		event.ResolveMountPoint(&event.Mount)
+		event.SetMountPoint(&event.Mount)
 		// Resolve root
-		event.ResolveMountRoot(&event.Mount)
+		event.SetMountRoot(&event.Mount)
 		// Insert new mount point in cache
 		p.resolvers.MountResolver.Insert(event.Mount)
+
+		// There could be entries of a previous mount_id in the cache for instance,
+		// runc does the following : it bind mounts itself (using /proc/exe/self),
+		// opens a file descriptor on the new file with O_CLOEXEC then umount the bind mount using
+		// MNT_DETACH. It then does an exec syscall, that will cause the fd to be closed.
+		// Our dentry resolution of the exec event causes the inode/mount_id to be put in cache,
+		// so we remove all dentry entries belonging to the mountID.
+		p.resolvers.DentryResolver.DelCacheEntries(event.Mount.MountID)
 	case model.FileUmountEventType:
 		if _, err := event.Umount.UnmarshalBinary(data[offset:]); err != nil {
 			log.Errorf("failed to decode umount event: %s (offset %d, len %d)", err, offset, dataLen)
@@ -432,8 +440,9 @@ func (p *Probe) handleEvent(CPU uint64, data []byte) {
 			log.Errorf("failed to decode fork event: %s (offset %d, len %d)", err, offset, dataLen)
 			return
 		}
-		event.updateProcessCachePointer(p.resolvers.ProcessResolver.AddForkEntry(event.ProcessContext.Pid, event.processCacheEntry))
+		p.resolvers.ProcessResolver.AddForkEntry(event.ProcessContext.Pid, event.processCacheEntry)
 	case model.ExecEventType:
+		// unmarshal and fill event.processCacheEntry
 		if _, err := event.UnmarshalProcess(data[offset:]); err != nil {
 			log.Errorf("failed to decode exec event: %s (offset %d, len %d)", err, offset, len(data))
 			return
@@ -444,9 +453,18 @@ func (p *Probe) handleEvent(CPU uint64, data []byte) {
 		if _, err := p.resolvers.ProcessResolver.SetProcessPath(event.processCacheEntry); err != nil {
 			log.Debugf("failed to resolve exec path: %s", err)
 		}
+		p.resolvers.ProcessResolver.SetProcessFilesystem(event.processCacheEntry)
 		p.resolvers.ProcessResolver.SetProcessContainerPath(event.processCacheEntry)
 
-		event.updateProcessCachePointer(p.resolvers.ProcessResolver.AddExecEntry(event.ProcessContext.Pid, event.processCacheEntry))
+		p.resolvers.ProcessResolver.SetProcessTTY(event.processCacheEntry)
+
+		p.resolvers.ProcessResolver.SetProcessUsersGroups(event.processCacheEntry)
+
+		p.resolvers.ProcessResolver.AddExecEntry(event.ProcessContext.Pid, event.processCacheEntry)
+
+		// copy some of the field from the entry
+		event.Exec.Process = event.processCacheEntry.Process
+		event.Exec.FileFields = event.processCacheEntry.Process.FileFields
 	case model.ExitEventType:
 		defer p.resolvers.ProcessResolver.DeleteEntry(event.ProcessContext.Pid, event.ResolveEventTimestamp())
 	case model.SetuidEventType:
@@ -475,6 +493,16 @@ func (p *Probe) handleEvent(CPU uint64, data []byte) {
 	// resolve event context
 	if eventType != model.ExitEventType {
 		event.ResolveProcessCacheEntry()
+
+		// in case of exec event we take the parent a process context as this
+		// the parent which generated the exec
+		if eventType == model.ExecEventType {
+			if ancestor := event.processCacheEntry.ProcessContext.Ancestor; ancestor != nil {
+				event.ProcessContext = ancestor.ProcessContext
+			}
+		} else {
+			event.ProcessContext = event.processCacheEntry.ProcessContext
+		}
 	}
 
 	p.DispatchEvent(event, dataLen, int(CPU), p.perfMap)
@@ -795,7 +823,7 @@ func NewProbe(config *config.Config, client *statsd.Client) (*Probe, error) {
 	// tail calls
 	p.managerOptions.TailCallRouter = probes.AllTailRoutes()
 
-	resolvers, err := NewResolvers(p, client)
+	resolvers, err := NewResolvers(config, p, client)
 	if err != nil {
 		return nil, err
 	}
