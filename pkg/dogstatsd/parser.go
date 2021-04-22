@@ -1,7 +1,7 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2018 Datadog, Inc.
+// Copyright 2016-2019 Datadog, Inc.
 
 package dogstatsd
 
@@ -11,26 +11,36 @@ import (
 	"fmt"
 	"strconv"
 
-	"github.com/DataDog/datadog-agent/pkg/util/log"
-
 	"github.com/DataDog/datadog-agent/pkg/metrics"
+	"github.com/DataDog/datadog-agent/pkg/tagger"
+	"github.com/DataDog/datadog-agent/pkg/tagger/collectors"
+	"github.com/DataDog/datadog-agent/pkg/util/kubernetes/kubelet"
+	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
 // Schema of a dogstatsd packet: see http://docs.datadoghq.com
 
-// MetricTypes maps the dogstatsd metric types to the agent metric types
-var metricTypes = map[string]metrics.MetricType{
-	"g":  metrics.GaugeType,
-	"c":  metrics.CounterType,
-	"s":  metrics.SetType,
-	"h":  metrics.HistogramType,
-	"ms": metrics.HistogramType,
-	"d":  metrics.DistributionType,
-}
+type tagRetriever func(entity string, cardinality collectors.TagCardinality) ([]string, error)
 
-var tagSeparator = []byte(",")
-var fieldSeparator = []byte("|")
-var valueSeparator = []byte(":")
+var (
+	// metricTypes maps the dogstatsd metric types to the agent metric types
+	metricTypes = map[string]metrics.MetricType{
+		"g":  metrics.GaugeType,
+		"c":  metrics.CounterType,
+		"s":  metrics.SetType,
+		"h":  metrics.HistogramType,
+		"ms": metrics.HistogramType,
+		"d":  metrics.DistributionType,
+	}
+	tagSeparator                      = []byte(",")
+	fieldSeparator                    = []byte("|")
+	valueSeparator                    = []byte(":")
+	hostTagPrefix                     = []byte("host:")
+	entityIDTagPrefix                 = []byte("dd.internal.entity_id:")
+	lenHostTagPrefix                  = len(hostTagPrefix)
+	lenEntityIDTagPrefix              = len(entityIDTagPrefix)
+	getTags              tagRetriever = tagger.Tag
+)
 
 func nextMessage(packet *[]byte) (message []byte) {
 	if len(*packet) == 0 {
@@ -57,21 +67,32 @@ func nextField(slice, sep []byte) ([]byte, []byte) {
 	return slice[:sepIndex], slice[sepIndex+1:]
 }
 
-// parseTags parses `rawTags` and returns a slice of tags and the value of the `host:` tag if found
-func parseTags(rawTags []byte, extractHost bool) ([]string, string) {
+// parseTags parses `rawTags` and returns a slice of tags
+// and the extracted hostname, injects tagger tags if an entity
+// is provided via a special tag
+func parseTags(rawTags []byte, defaultHostname string) ([]string, string) {
 	if len(rawTags) == 0 {
-		return nil, ""
+		return nil, defaultHostname
 	}
 
-	host := defaultHostname
 	tagsList := make([]string, 0, bytes.Count(rawTags, tagSeparator)+1)
+	host := defaultHostname
 	remainder := rawTags
 
 	var tag []byte
 	for {
 		tag, remainder = nextField(remainder, tagSeparator)
-		if extractHost && bytes.HasPrefix(tag, []byte("host:")) {
-			host = string(tag[5:])
+		if bytes.HasPrefix(tag, hostTagPrefix) {
+			host = string(tag[lenHostTagPrefix:])
+		} else if bytes.HasPrefix(tag, entityIDTagPrefix) {
+			// currently only supported for pods
+			entity := kubelet.KubePodPrefix + string(tag[lenEntityIDTagPrefix:])
+			entityTags, err := getTags(entity, tagger.DogstatsdCardinality)
+			if err != nil {
+				log.Tracef("Cannot get tags for entity %s: %s", entity, err)
+				continue
+			}
+			tagsList = append(tagsList, entityTags...)
 		} else {
 			tagsList = append(tagsList, string(tag))
 		}
@@ -83,7 +104,7 @@ func parseTags(rawTags []byte, extractHost bool) ([]string, string) {
 	return tagsList, host
 }
 
-func parseServiceCheckMessage(message []byte) (*metrics.ServiceCheck, error) {
+func parseServiceCheckMessage(message []byte, defaultHostname string) (*metrics.ServiceCheck, error) {
 	// _sc|name|status|[metadata|...]
 
 	separatorCount := bytes.Count(message, fieldSeparator)
@@ -109,6 +130,11 @@ func parseServiceCheckMessage(message []byte) (*metrics.ServiceCheck, error) {
 		service.Status = serviceStatus
 	}
 
+	// Handle hostname, with a priority to the h: field, then the host:
+	// tag and finally the defaultHostname value
+	var hostFromField string
+	hostFromTags := defaultHostname
+
 	// Metadata
 	for {
 		var rawMetadataField []byte
@@ -125,9 +151,9 @@ func parseServiceCheckMessage(message []byte) (*metrics.ServiceCheck, error) {
 			}
 			service.Ts = ts
 		} else if bytes.HasPrefix(rawMetadataField, []byte("h:")) {
-			service.Host = string(rawMetadataField[2:])
+			hostFromField = string(rawMetadataField[2:])
 		} else if bytes.HasPrefix(rawMetadataField, []byte("#")) {
-			service.Tags, _ = parseTags(rawMetadataField[1:], false)
+			service.Tags, hostFromTags = parseTags(rawMetadataField[1:], defaultHostname)
 		} else if bytes.HasPrefix(rawMetadataField, []byte("m:")) {
 			service.Message = string(rawMetadataField[2:])
 		} else {
@@ -135,10 +161,15 @@ func parseServiceCheckMessage(message []byte) (*metrics.ServiceCheck, error) {
 		}
 	}
 
+	if hostFromField != "" {
+		service.Host = hostFromField
+	} else {
+		service.Host = hostFromTags
+	}
 	return &service, nil
 }
 
-func parseEventMessage(message []byte) (*metrics.Event, error) {
+func parseEventMessage(message []byte, defaultHostname string) (*metrics.Event, error) {
 	// _e{title.length,text.length}:title|text
 	//  [
 	//   |d:date_happened
@@ -189,6 +220,11 @@ func parseEventMessage(message []byte) (*metrics.Event, error) {
 		Text:      string(bytes.Replace(rawText, []byte("\\n"), []byte("\n"), -1)),
 	}
 
+	// Handle hostname, with a priority to the h: field, then the host:
+	// tag and finally the defaultHostname value
+	var hostFromField string
+	hostFromTags := defaultHostname
+
 	// Metadata
 	if len(message) > 1 {
 		rawMetadataFields := bytes.Split(message[1:], []byte("|"))
@@ -209,7 +245,7 @@ func parseEventMessage(message []byte) (*metrics.Event, error) {
 				}
 				event.Priority = priority
 			} else if bytes.HasPrefix(rawMetadataFields[i], []byte("h:")) {
-				event.Host = string(rawMetadataFields[i][2:])
+				hostFromField = string(rawMetadataFields[i][2:])
 			} else if bytes.HasPrefix(rawMetadataFields[i], []byte("t:")) {
 				t, err := metrics.GetAlertTypeFromString(string(rawMetadataFields[i][2:]))
 				if err != nil {
@@ -222,17 +258,22 @@ func parseEventMessage(message []byte) (*metrics.Event, error) {
 			} else if bytes.HasPrefix(rawMetadataFields[i], []byte("s:")) {
 				event.SourceTypeName = string(rawMetadataFields[i][2:])
 			} else if bytes.HasPrefix(rawMetadataFields[i], []byte("#")) {
-				event.Tags, _ = parseTags(rawMetadataFields[i][1:], false)
+				event.Tags, hostFromTags = parseTags(rawMetadataFields[i][1:], defaultHostname)
 			} else {
 				log.Warnf("unknown metadata type: '%s'", rawMetadataFields[i])
 			}
 		}
 	}
 
+	if hostFromField != "" {
+		event.Host = hostFromField
+	} else {
+		event.Host = hostFromTags
+	}
 	return &event, nil
 }
 
-func parseMetricMessage(message []byte, namespace string) (*metrics.MetricSample, error) {
+func parseMetricMessage(message []byte, namespace string, defaultHostname string) (*metrics.MetricSample, error) {
 	// daemon:666|g|#sometag1:somevalue1,sometag2:somevalue2
 	// daemon:666|g|@0.1|#sometag:somevalue"
 
@@ -263,7 +304,7 @@ func parseMetricMessage(message []byte, namespace string) (*metrics.MetricSample
 		rawMetadataField, remainder = nextField(remainder, fieldSeparator)
 
 		if bytes.HasPrefix(rawMetadataField, []byte("#")) {
-			metricTags, host = parseTags(rawMetadataField[1:], true)
+			metricTags, host = parseTags(rawMetadataField[1:], defaultHostname)
 		} else if bytes.HasPrefix(rawMetadataField, []byte("@")) {
 			rawSampleRate := rawMetadataField[1:]
 			var err error

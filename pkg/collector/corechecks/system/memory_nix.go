@@ -1,7 +1,7 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2018 Datadog, Inc.
+// Copyright 2016-2019 Datadog, Inc.
 
 // +build !windows
 
@@ -43,7 +43,7 @@ func (c *MemoryCheck) Run() error {
 		sender.Gauge("system.mem.free", float64(v.Free)/mbSize, "", nil)
 		sender.Gauge("system.mem.used", float64(v.Total-v.Free)/mbSize, "", nil)
 		sender.Gauge("system.mem.usable", float64(v.Available)/mbSize, "", nil)
-		sender.Gauge("system.mem.pct_usable", float64(100-v.UsedPercent)/100, "", nil)
+		sender.Gauge("system.mem.pct_usable", float64(v.Available)/float64(v.Total), "", nil)
 
 		switch runtimeOS {
 		case "linux":
@@ -86,6 +86,7 @@ func (c *MemoryCheck) linuxSpecificVirtualMemoryCheck(v *mem.VirtualMemoryStat) 
 	}
 
 	sender.Gauge("system.mem.cached", float64(v.Cached)/mbSize, "", nil)
+	sender.Gauge("system.mem.buffered", float64(v.Buffers)/mbSize, "", nil)
 	sender.Gauge("system.mem.shared", float64(v.Shared)/mbSize, "", nil)
 	sender.Gauge("system.mem.slab", float64(v.Slab)/mbSize, "", nil)
 	sender.Gauge("system.mem.page_tables", float64(v.PageTables)/mbSize, "", nil)

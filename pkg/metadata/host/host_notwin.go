@@ -1,7 +1,7 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2018 Datadog, Inc.
+// Copyright 2016-2019 Datadog, Inc.
 
 // +build !windows
 
@@ -43,7 +43,7 @@ func getSystemStats() *systemStats {
 			Platform:  runtime.GOOS,
 			Processor: cpuInfo.ModelName,
 			CPUCores:  cpuInfo.Cores,
-			Pythonv:   strings.Split(getPythonVersion(), " ")[0],
+			Pythonv:   strings.Split(GetPythonVersion(), " ")[0],
 		}
 
 		// fill the platform dependent bits of info

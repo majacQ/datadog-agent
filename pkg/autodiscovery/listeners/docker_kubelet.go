@@ -1,7 +1,7 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2018 Datadog, Inc.
+// Copyright 2016-2019 Datadog, Inc.
 
 // +build docker,kubelet
 
@@ -14,9 +14,8 @@ package listeners
 import (
 	"fmt"
 	"sort"
-	"strings"
+	"sync"
 
-	"github.com/DataDog/datadog-agent/pkg/util/docker"
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes/kubelet"
 )
 
@@ -27,6 +26,7 @@ type DockerKubeletService struct {
 	kubeUtil *kubelet.KubeUtil
 	Hosts    map[string]string
 	Ports    []ContainerPort
+	sync.RWMutex
 }
 
 // getPod wraps KubeUtil init and pod lookup for both public methods.
@@ -38,12 +38,15 @@ func (s *DockerKubeletService) getPod() (*kubelet.Pod, error) {
 			return nil, err
 		}
 	}
-	searchedId := docker.ContainerIDToEntityName(string(s.GetID()))
+	searchedId := s.GetEntity()
 	return s.kubeUtil.GetPodForContainerID(searchedId)
 }
 
 // GetHosts returns the container's hosts
 func (s *DockerKubeletService) GetHosts() (map[string]string, error) {
+	s.Lock()
+	defer s.Unlock()
+
 	if s.Hosts != nil {
 		return s.Hosts, nil
 	}
@@ -67,10 +70,10 @@ func (s *DockerKubeletService) GetPorts() ([]ContainerPort, error) {
 	if err != nil {
 		return nil, err
 	}
-	searchedId := string(s.GetID())
+	searchedId := s.GetEntity()
 	var searchedContainerName string
 	for _, container := range pod.Status.Containers {
-		if strings.HasSuffix(container.ID, searchedId) {
+		if container.ID == searchedId {
 			searchedContainerName = container.Name
 		}
 	}

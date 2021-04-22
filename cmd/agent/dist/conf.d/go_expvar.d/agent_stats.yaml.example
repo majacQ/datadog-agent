@@ -38,7 +38,7 @@ instances:
   # The following instance pulls the go_expvar metrics of the running datadog-agent
   # Feel free to comment out the instance if you're not interested in these metrics
   - expvar_url: http://localhost:5000/debug/vars  # if you've defined `expvar_port` in datadog.yaml, change the port here to that value
-    namespace: datadog
+    namespace: datadog.agent
     metrics:
       # datadog-agent forwarder monitoring
       - path: forwarder/Transactions/Series
@@ -62,9 +62,28 @@ instances:
       - path: forwarder/Transactions/RetryQueueSize
       - path: forwarder/Transactions/Success
         type: rate
+      - path: forwarder/Transactions/Errors
+        type: rate
+      - path: forwarder/Transactions/ErrorsByType/DNSErrors
+        type: rate
+      - path: forwarder/Transactions/ErrorsByType/TLSErrors
+        type: rate
+      - path: forwarder/Transactions/ErrorsByType/ConnectionErrors
+        type: rate
+      - path: forwarder/Transactions/ErrorsByType/WroteRequestErrors
+        type: rate
+      - path: forwarder/Transactions/ErrorsByType/SentRequestErrors
+        type: rate
+      - path: forwarder/Transactions/HTTPErrors
+        type: rate
+
 
       # datadog-agent dogstatsd monitoring
+      - path: dogstatsd-udp/Packets
+        type: rate
       - path: dogstatsd-udp/PacketReadingErrors
+        type: rate
+      - path: dogstatsd-uds/Packets
         type: rate
       - path: dogstatsd-uds/PacketReadingErrors
         type: rate
@@ -126,4 +145,18 @@ instances:
       - path: splitter/TooBig
         type: rate
       - path: splitter/TotalLoops
+        type: rate
+      - path: splitter/PayloadDrops
+        type: rate
+
+      # datadog-agent logs-agent monitoring
+      - path: logs-agent/IsRunning
+        type: gauge
+      - path: logs-agent/DestinationErrors
+        type: rate
+      - path: logs-agent/LogsDecoded
+        type: rate
+      - path: logs-agent/LogsProcessed
+        type: rate
+      - path: logs-agent/LogsSent
         type: rate

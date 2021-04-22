@@ -1,7 +1,7 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2018 Datadog, Inc.
+// Copyright 2016-2019 Datadog, Inc.
 
 // +build cpython
 
@@ -49,6 +49,16 @@ const (
 	pyPkgModule           = "utils.py_packages"
 	pyPsutilProcPath      = "psutil.PROCFS_PATH"
 	pyIntegrationListFunc = "get_datadog_wheels"
+)
+
+var (
+	// implements a string set of non-intergrations with an empty stuct map
+	nonIntegrationsWheelSet = map[string]struct{}{
+		"checks_base":        {},
+		"checks_dev":         {},
+		"checks_test_helper": {},
+		"a7":                 {},
+	}
 )
 
 // newStickyLock register the current thread with the interpreter and locks
@@ -101,17 +111,20 @@ func (sl *stickyLock) getPythonError() (string, error) {
 	if ptraceback != nil && ptraceback.GetCPointer() != nil {
 		// There's a traceback, try to format it nicely
 		traceback := python.PyImport_ImportModule("traceback")
+		defer traceback.DecRef()
 		formatExcFn := traceback.GetAttrString("format_exception")
 		if formatExcFn != nil {
 			defer formatExcFn.DecRef()
 			pyFormattedExc := formatExcFn.CallFunction(ptype, pvalue, ptraceback)
 			if pyFormattedExc != nil {
 				defer pyFormattedExc.DecRef()
-				pyStringExc := pyFormattedExc.Str()
-				if pyStringExc != nil {
-					defer pyStringExc.DecRef()
-					return python.PyString_AsString(pyStringExc), nil
+
+				tracebackString := ""
+				// "format_exception" return a list of strings (one per line)
+				for i := 0; i < python.PyList_Size(pyFormattedExc); i++ {
+					tracebackString = tracebackString + python.PyString_AsString(python.PyList_GetItem(pyFormattedExc, i))
 				}
+				return tracebackString, nil
 			}
 		}
 
@@ -445,7 +458,7 @@ func GetPythonIntegrationList() ([]string, error) {
 	ddPythonPackages := []string{}
 	for i := 0; i < python.PyList_Size(packages); i++ {
 		pkgName := python.PyString_AsString(python.PyList_GetItem(packages, i))
-		if pkgName == "checks_base" {
+		if _, ok := nonIntegrationsWheelSet[pkgName]; ok {
 			continue
 		}
 		ddPythonPackages = append(ddPythonPackages, pkgName)

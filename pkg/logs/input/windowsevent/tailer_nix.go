@@ -1,18 +1,18 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2018 Datadog, Inc.
+// Copyright 2016-2019 Datadog, Inc.
 
 // +build !windows
 
 package windowsevent
 
 import (
-	log "github.com/cihub/seelog"
+	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
 // Start does not do much
-func (t *Tailer) Start(_ string) {
+func (t *Tailer) Start() {
 	log.Warn("windows event log not supported on this system")
 	go t.tail()
 }

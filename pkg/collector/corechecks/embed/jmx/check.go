@@ -1,7 +1,7 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2018 Datadog, Inc.
+// Copyright 2016-2019 Datadog, Inc.
 
 // +build jmx
 
@@ -45,7 +45,7 @@ func (c *JMXCheck) Run() error {
 	case <-state.runnerError:
 		return fmt.Errorf("jmxfetch exited, stopping %s : %s", c.name, err)
 	case <-c.stop:
-		log.Debug("jmx check %s stopped", c.name)
+		log.Infof("jmx check %s stopped", c.name)
 	}
 
 	return nil
@@ -58,6 +58,10 @@ func (c *JMXCheck) Stop() {
 
 func (c *JMXCheck) String() string {
 	return c.name
+}
+
+func (c *JMXCheck) Version() string {
+	return ""
 }
 
 func (c *JMXCheck) Configure(config integration.Data, initConfig integration.Data) error {

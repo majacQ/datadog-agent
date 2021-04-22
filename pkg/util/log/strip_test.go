@@ -1,7 +1,7 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2018 Datadog, Inc.
+// Copyright 2016-2019 Datadog, Inc.
 
 package log
 
@@ -61,6 +61,34 @@ func TestConfigStripApiKey(t *testing.T) {
 	assertClean(t,
 		`container_id: "b32bd6f9b73ba7ccb64953a04b82b48e29dfafab65fd57ca01d3b94a0e024885"`,
 		`container_id: "b32bd6f9b73ba7ccb64953a04b82b48e29dfafab65fd57ca01d3b94a0e024885"`)
+}
+
+func TestConfigAppKey(t *testing.T) {
+	assertClean(t,
+		`app_key: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbb`,
+		`app_key: ***********************************abbbb`)
+	assertClean(t,
+		`app_key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABBBB`,
+		`app_key: ***********************************ABBBB`)
+	assertClean(t,
+		`app_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbb"`,
+		`app_key: "***********************************abbbb"`)
+	assertClean(t,
+		`app_key: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbb'`,
+		`app_key: '***********************************abbbb'`)
+	assertClean(t,
+		`app_key: |
+			aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbb`,
+		`app_key: |
+			***********************************abbbb`)
+	assertClean(t,
+		`app_key: >
+			aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbb`,
+		`app_key: >
+			***********************************abbbb`)
+	assertClean(t,
+		`   app_key:   'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbb'   `,
+		`   app_key:   '***********************************abbbb'   `)
 }
 
 func TestConfigStripURLPassword(t *testing.T) {

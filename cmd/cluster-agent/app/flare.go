@@ -1,7 +1,7 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2018 Datadog, Inc.
+// Copyright 2016-2019 Datadog, Inc.
 
 // +build kubeapiserver
 
@@ -38,6 +38,8 @@ var flareCmd = &cobra.Command{
 	Short: "Collect a flare and send it to Datadog",
 	Long:  ``,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		// we'll search for a config file named `datadog-cluster.yaml`
+		config.Datadog.SetConfigName("datadog-cluster")
 		err := common.SetupConfig(confPath)
 		if err != nil {
 			return fmt.Errorf("unable to set up global cluster agent configuration: %v", err)
@@ -71,7 +73,7 @@ func requestFlare(caseID string) error {
 	fmt.Println("Asking the Cluster Agent to build the flare archive.")
 	var e error
 	c := util.GetClient(false) // FIX: get certificates right then make this true
-	urlstr := fmt.Sprintf("https://localhost:%v/flare", config.Datadog.GetInt("cluster_agent_cmd_port"))
+	urlstr := fmt.Sprintf("https://localhost:%v/flare", config.Datadog.GetInt("cluster_agent.cmd_port"))
 
 	logFile := config.Datadog.GetString("log_file")
 	if logFile == "" {

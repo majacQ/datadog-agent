@@ -1,7 +1,7 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2018 Datadog, Inc.
+// Copyright 2016-2019 Datadog, Inc.
 
 // +build consul
 
@@ -99,7 +99,7 @@ func NewConsulConfigProvider(config config.ConfigurationProviders) (ConfigProvid
 
 // String returns a string representation of the ConsulConfigProvider
 func (p *ConsulConfigProvider) String() string {
-	return "consul Configuration Provider"
+	return Consul
 }
 
 // Collect retrieves templates from consul, builds Config objects and returns them

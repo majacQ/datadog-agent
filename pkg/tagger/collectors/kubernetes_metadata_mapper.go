@@ -1,7 +1,7 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2018 Datadog, Inc.
+// Copyright 2016-2019 Datadog, Inc.
 
 // +build kubeapiserver,kubelet
 
@@ -9,9 +9,6 @@ package collectors
 
 import (
 	"strings"
-
-	"k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/DataDog/datadog-agent/pkg/config"
 	"github.com/DataDog/datadog-agent/pkg/tagger/utils"
@@ -35,10 +32,11 @@ func (c *KubeMetadataCollector) getTagInfos(pods []*kubelet.Pod) []*TagInfo {
 		if po.Spec.HostNetwork == true {
 			for _, container := range po.Status.Containers {
 				info := &TagInfo{
-					Source:       kubeMetadataCollectorName,
-					Entity:       container.ID,
-					HighCardTags: []string{},
-					LowCardTags:  []string{},
+					Source:               kubeMetadataCollectorName,
+					Entity:               container.ID,
+					HighCardTags:         []string{},
+					OrchestratorCardTags: []string{},
+					LowCardTags:          []string{},
 				}
 				tagInfo = append(tagInfo, info)
 			}
@@ -46,16 +44,17 @@ func (c *KubeMetadataCollector) getTagInfos(pods []*kubelet.Pod) []*TagInfo {
 		}
 
 		tagList := utils.NewTagList()
-		if !config.Datadog.GetBool("cluster_agent") {
-			metadataNames, err = apiserver.GetPodMetadataNames(po.Spec.NodeName, po.Metadata.Name)
+		if !config.Datadog.GetBool("cluster_agent.enabled") {
+			metadataNames, err = apiserver.GetPodMetadataNames(po.Spec.NodeName, po.Metadata.Namespace, po.Metadata.Name)
 			if err != nil {
 				log.Errorf("Could not fetch cluster level tags for the pod %s: %s", po.Metadata.Name, err.Error())
 				continue
 			}
 		} else {
-			metadataNames, err = c.dcaClient.GetKubernetesMetadataNames(po.Spec.NodeName, po.Metadata.Name)
+			metadataNames, err = c.dcaClient.GetKubernetesMetadataNames(po.Spec.NodeName, po.Metadata.Namespace, po.Metadata.Name)
 			if err != nil {
-				log.Tracef("Could not pull the metadata map of po %s on node %s from the Datadog Cluster Agent: %s", po.Metadata.Name, po.Spec.NodeName, err.Error())
+				log.Debugf("Could not pull the metadata map of po %s on node %s from the Datadog Cluster Agent: %s", po.Metadata.Name, po.Spec.NodeName, err.Error())
+				continue
 			}
 		}
 		for _, tagDCA := range metadataNames {
@@ -67,24 +66,26 @@ func (c *KubeMetadataCollector) getTagInfos(pods []*kubelet.Pod) []*TagInfo {
 			tagList.AddLow(tag[0], tag[1])
 		}
 
-		low, high := tagList.Compute()
+		low, orchestrator, high := tagList.Compute()
 		// Register the tags for the pod itself
 		if po.Metadata.UID != "" {
 			podInfo := &TagInfo{
-				Source:       kubeMetadataCollectorName,
-				Entity:       kubelet.PodUIDToEntityName(po.Metadata.UID),
-				HighCardTags: high,
-				LowCardTags:  low,
+				Source:               kubeMetadataCollectorName,
+				Entity:               kubelet.PodUIDToEntityName(po.Metadata.UID),
+				HighCardTags:         high,
+				OrchestratorCardTags: orchestrator,
+				LowCardTags:          low,
 			}
 			tagInfo = append(tagInfo, podInfo)
 		}
 		// Register the tags for all its containers
 		for _, container := range po.Status.Containers {
 			info := &TagInfo{
-				Source:       kubeMetadataCollectorName,
-				Entity:       container.ID,
-				HighCardTags: high,
-				LowCardTags:  low,
+				Source:               kubeMetadataCollectorName,
+				Entity:               container.ID,
+				HighCardTags:         high,
+				OrchestratorCardTags: orchestrator,
+				LowCardTags:          low,
 			}
 			tagInfo = append(tagInfo, info)
 		}
@@ -99,7 +100,7 @@ func (c *KubeMetadataCollector) addToCacheMetadataMapping(kubeletPodList []*kube
 		return nil
 	}
 
-	podList := &v1.PodList{}
+	reachablePods := make([]*kubelet.Pod, 0)
 	nodeName := ""
 	for _, p := range kubeletPodList {
 		if p.Status.PodIP == "" {
@@ -108,17 +109,7 @@ func (c *KubeMetadataCollector) addToCacheMetadataMapping(kubeletPodList []*kube
 		if nodeName == "" && p.Spec.NodeName != "" {
 			nodeName = p.Spec.NodeName
 		}
-
-		pod := &v1.Pod{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      p.Metadata.Name,
-				Namespace: p.Metadata.Namespace,
-			},
-			Status: v1.PodStatus{
-				PodIP: p.Status.PodIP,
-			},
-		}
-		podList.Items = append(podList.Items, *pod)
+		reachablePods = append(reachablePods, p)
 	}
-	return c.apiClient.NodeMetadataMapping(nodeName, podList)
+	return c.apiClient.NodeMetadataMapping(nodeName, reachablePods)
 }

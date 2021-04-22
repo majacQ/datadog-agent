@@ -1,7 +1,7 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2018 Datadog, Inc.
+// Copyright 2016-2019 Datadog, Inc.
 
 // +build kubelet
 
@@ -10,6 +10,7 @@ package kubelet
 import (
 	"crypto/tls"
 	"encoding/json"
+	"expvar"
 	"fmt"
 	"io/ioutil"
 	"net/http"
@@ -17,13 +18,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/DataDog/datadog-agent/pkg/util/log"
-
 	"github.com/DataDog/datadog-agent/pkg/config"
 	"github.com/DataDog/datadog-agent/pkg/errors"
 	"github.com/DataDog/datadog-agent/pkg/util/cache"
+	"github.com/DataDog/datadog-agent/pkg/util/containers"
 	"github.com/DataDog/datadog-agent/pkg/util/docker"
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes"
+	"github.com/DataDog/datadog-agent/pkg/util/kubernetes/clustername"
+	"github.com/DataDog/datadog-agent/pkg/util/log"
 	"github.com/DataDog/datadog-agent/pkg/util/retry"
 )
 
@@ -32,9 +34,14 @@ const (
 	kubeletMetricsPath     = "/metrics"
 	authorizationHeaderKey = "Authorization"
 	podListCacheKey        = "KubeletPodListCacheKey"
+	unreadyAnnotation      = "ad.datadoghq.com/tolerate-unready"
+	configSourceAnnotation = "kubernetes.io/config.source"
 )
 
-var globalKubeUtil *KubeUtil
+var (
+	globalKubeUtil *KubeUtil
+	kubeletExpVar  = expvar.NewInt("kubeletQueries")
+)
 
 // KubeUtil is a struct to hold the kubelet api url
 // Instantiate with GetKubeUtil
@@ -48,6 +55,8 @@ type KubeUtil struct {
 	kubeletApiRequestHeaders *http.Header
 	rawConnectionInfo        map[string]string // kept to pass to the python kubelet check
 	podListCacheDuration     time.Duration
+	filter                   *containers.Filter
+	waitOnMissingContainer   time.Duration
 }
 
 // ResetGlobalKubeUtil is a helper to remove the current KubeUtil global
@@ -66,8 +75,14 @@ func newKubeUtil() *KubeUtil {
 		kubeletApiClient:         &http.Client{Timeout: time.Second},
 		kubeletApiRequestHeaders: &http.Header{},
 		rawConnectionInfo:        make(map[string]string),
-		podListCacheDuration:     10 * time.Second,
+		podListCacheDuration:     config.Datadog.GetDuration("kubelet_cache_pods_duration") * time.Second,
 	}
+
+	waitOnMissingContainer := config.Datadog.GetDuration("kubelet_wait_on_missing_container")
+	if waitOnMissingContainer > 0 {
+		ku.waitOnMissingContainer = waitOnMissingContainer * time.Second
+	}
+
 	return ku
 }
 
@@ -85,14 +100,14 @@ func GetKubeUtil() (*KubeUtil, error) {
 	}
 	err := globalKubeUtil.initRetry.TriggerRetry()
 	if err != nil {
-		log.Debugf("Init error: %s", err)
+		log.Debugf("Kube util init error: %s", err)
 		return nil, err
 	}
 	return globalKubeUtil, nil
 }
 
 // HostnameProvider kubelet implementation for the hostname provider
-func HostnameProvider(hostName string) (string, error) {
+func HostnameProvider() (string, error) {
 	ku, err := GetKubeUtil()
 	if err != nil {
 		return "", err
@@ -117,8 +132,24 @@ func (ku *KubeUtil) GetNodeInfo() (string, string, error) {
 	return "", "", fmt.Errorf("failed to get node info, pod list length: %d", len(pods))
 }
 
-// GetHostname returns the hostname of the first pod.spec.nodeName in the PodList
+// GetHostname builds a hostname from the kubernetes nodename and an optional cluster-name
 func (ku *KubeUtil) GetHostname() (string, error) {
+	nodeName, err := ku.GetNodename()
+	if err != nil {
+		return "", fmt.Errorf("couldn't fetch the host nodename from the kubelet: %s", err)
+	}
+
+	clusterName := clustername.GetClusterName()
+	if clusterName == "" {
+		log.Debugf("Now using plain kubernetes nodename as an alias: no cluster name was set and none could be autodiscovered")
+		return nodeName, nil
+	} else {
+		return (nodeName + "-" + clusterName), nil
+	}
+}
+
+// GetNodename returns the nodename of the first pod.spec.nodeName in the PodList
+func (ku *KubeUtil) GetNodename() (string, error) {
 	pods, err := ku.GetLocalPodList()
 	if err != nil {
 		return "", fmt.Errorf("error getting pod list from kubelet: %s", err)
@@ -131,7 +162,7 @@ func (ku *KubeUtil) GetHostname() (string, error) {
 		return pod.Spec.NodeName, nil
 	}
 
-	return "", fmt.Errorf("failed to get hostname, pod list length: %d", len(pods))
+	return "", fmt.Errorf("failed to get the kubernetes nodename, pod list length: %d", len(pods))
 }
 
 // GetLocalPodList returns the list of pods running on the node
@@ -167,11 +198,6 @@ func (ku *KubeUtil) GetLocalPodList() ([]*Pod, error) {
 	return pods.Items, nil
 }
 
-// SetPodListCacheDuration sets the podlist cache duration
-func (ku *KubeUtil) SetPodListCacheDuration(duration time.Duration) {
-	ku.podListCacheDuration = duration
-}
-
 // ForceGetLocalPodList reset podList cache and call GetLocalPodList
 func (ku *KubeUtil) ForceGetLocalPodList() ([]*Pod, error) {
 	ResetCache()
@@ -182,23 +208,57 @@ func (ku *KubeUtil) ForceGetLocalPodList() ([]*Pod, error) {
 // a given container on the node. Reset the cache if needed.
 // Returns a nil pointer if not found.
 func (ku *KubeUtil) GetPodForContainerID(containerID string) (*Pod, error) {
+	// Best case scenario
 	pods, err := ku.GetLocalPodList()
 	if err != nil {
 		return nil, err
 	}
 	pod, err := ku.searchPodForContainerID(pods, containerID)
+	if err == nil {
+		return pod, nil
+	}
+
+	// Retry with cache invalidation
 	if err != nil && errors.IsNotFound(err) {
-		log.Debugf("Cannot get the containerID %q: %s, retrying without cache...", containerID, err)
+		log.Debugf("Cannot get container %q: %s, retrying without cache...", containerID, err)
 		pods, err = ku.ForceGetLocalPodList()
 		if err != nil {
 			return nil, err
 		}
 		pod, err = ku.searchPodForContainerID(pods, containerID)
-		if err != nil {
+		if err == nil {
+			return pod, nil
+		}
+	}
+
+	// On some kubelet versions, containers can take up to a second to
+	// register in the podlist, retry a few times before failing
+	if ku.waitOnMissingContainer == 0 {
+		log.Tracef("Still cannot get container %q, wait disabled", containerID)
+		return pod, err
+	}
+	timeout := time.NewTimer(ku.waitOnMissingContainer)
+	defer timeout.Stop()
+	retryTicker := time.NewTicker(250 * time.Millisecond)
+	defer retryTicker.Stop()
+	for {
+		log.Tracef("Still cannot get container %q: %s, retrying in 250ms", containerID, err)
+		select {
+		case <-retryTicker.C:
+			pods, err = ku.ForceGetLocalPodList()
+			if err != nil {
+				continue
+			}
+			pod, err = ku.searchPodForContainerID(pods, containerID)
+			if err != nil {
+				continue
+			}
+			return pod, nil
+		case <-timeout.C:
+			// Return the latest error on timeout
 			return nil, err
 		}
 	}
-	return pod, err
 }
 
 func (ku *KubeUtil) searchPodForContainerID(podList []*Pod, containerID string) (*Pod, error) {
@@ -354,6 +414,7 @@ func (ku *KubeUtil) QueryKubelet(path string) ([]byte, int, error) {
 	}
 
 	response, err := ku.kubeletApiClient.Do(req)
+	kubeletExpVar.Add(1)
 	if err != nil {
 		log.Debugf("Cannot request %s: %s", req.URL.String(), err)
 		return nil, 0, err
@@ -442,7 +503,7 @@ func (ku *KubeUtil) init() error {
 	// setting the kubeletHost
 	ku.kubeletHost = config.Datadog.GetString("kubernetes_kubelet_host")
 	if ku.kubeletHost == "" {
-		ku.kubeletHost, err = docker.HostnameProvider("")
+		ku.kubeletHost, err = docker.HostnameProvider()
 		if err != nil {
 			return fmt.Errorf("unable to get hostname from docker, please set the kubernetes_kubelet_host option: %s", err)
 		}
@@ -467,18 +528,42 @@ func (ku *KubeUtil) init() error {
 	if err != nil {
 		return err
 	}
+
+	ku.filter, err = containers.GetSharedFilter()
+	if err != nil {
+		return err
+	}
+
 	return ku.setupKubeletApiEndpoint()
 }
 
 // IsPodReady return a bool if the Pod is ready
 func IsPodReady(pod *Pod) bool {
+	// static pods are always reported as Pending, so we make an exception there
+	if pod.Status.Phase == "Pending" && isPodStatic(pod) {
+		return true
+	}
+
 	if pod.Status.Phase != "Running" {
 		return false
+	}
+
+	if tolerate, ok := pod.Metadata.Annotations[unreadyAnnotation]; ok && tolerate == "true" {
+		return true
 	}
 	for _, status := range pod.Status.Conditions {
 		if status.Type == "Ready" && status.Status == "True" {
 			return true
 		}
+	}
+	return false
+}
+
+// isPodStatic identifies whether a pod is static or not based on an annotation
+// Static pods can be sent to the kubelet from files or an http endpoint.
+func isPodStatic(pod *Pod) bool {
+	if source, ok := pod.Metadata.Annotations[configSourceAnnotation]; ok == true && (source == "file" || source == "http") {
+		return len(pod.Status.Containers) == 0
 	}
 	return false
 }

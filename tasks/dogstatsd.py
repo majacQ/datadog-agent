@@ -13,7 +13,7 @@ from invoke import task
 from invoke.exceptions import Exit
 
 from .build_tags import get_build_tags, get_default_build_tags
-from .utils import get_build_flags, bin_name, get_root, load_release_versions
+from .utils import get_build_flags, bin_name, get_root, load_release_versions, get_version
 from .utils import REPO_PATH
 
 from .go import deps
@@ -45,8 +45,9 @@ def build(ctx, rebuild=False, race=False, static=False, build_include=None,
     if static:
         bin_path = STATIC_BIN_PATH
 
+    # NOTE: consider stripping symbols to reduce binary size
     cmd = "go build {race_opt} {build_type} -tags '{build_tags}' -o {bin_name} "
-    cmd += "-gcflags=\"{gcflags}\" -ldflags=\"{ldflags}\" {REPO_PATH}/cmd/dogstatsd/"
+    cmd += "-gcflags=\"{gcflags}\" -ldflags=\"{ldflags}\" {REPO_PATH}/cmd/dogstatsd"
     args = {
         "race_opt": "-race" if race else "",
         "build_type": "-a" if rebuild else "",
@@ -68,6 +69,16 @@ def build(ctx, rebuild=False, race=False, static=False, build_include=None,
     }
     cmd = "go generate {}/cmd/dogstatsd"
     ctx.run(cmd.format(REPO_PATH), env=env)
+
+    if static and sys.platform.startswith("linux"):
+        cmd = "file {bin_name} "
+        args = {
+            "bin_name": os.path.join(bin_path, bin_name("dogstatsd")),
+        }
+        result = ctx.run(cmd.format(**args))
+        if "statically linked" not in result.stdout:
+            print("Dogstatsd binary is not static, exiting...")
+            raise Exit(code=1)
 
     refresh_assets(ctx)
 
@@ -181,6 +192,7 @@ def omnibus_build(ctx, log_level="info", base_dir=None, gem_path=None,
         }
         if omnibus_s3_cache:
             args['populate_s3_cache'] = " --populate-s3-cache "
+        env['PACKAGE_VERSION'] = get_version(ctx, include_git=True, url_safe=True, git_sha_length=7)
         ctx.run(cmd.format(**args), env=env)
 
 

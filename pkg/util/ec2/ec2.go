@@ -1,7 +1,7 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2018 Datadog, Inc.
+// Copyright 2016-2019 Datadog, Inc.
 
 package ec2
 
@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/DataDog/datadog-agent/pkg/util/ecs"
+	"github.com/DataDog/datadog-agent/pkg/config"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
@@ -26,12 +26,23 @@ var (
 
 // GetInstanceID fetches the instance id for current host from the EC2 metadata API
 func GetInstanceID() (string, error) {
-	return getMetadataItem("/instance-id")
+	return getMetadataItemWithMaxLength("/instance-id", config.Datadog.GetInt("metadata_endpoints_max_hostname_size"))
 }
 
 // GetHostname fetches the hostname for current host from the EC2 metadata API
 func GetHostname() (string, error) {
-	return getMetadataItem("/hostname")
+	return getMetadataItemWithMaxLength("/hostname", config.Datadog.GetInt("metadata_endpoints_max_hostname_size"))
+}
+
+func getMetadataItemWithMaxLength(endpoint string, maxLength int) (string, error) {
+	result, err := getMetadataItem(endpoint)
+	if err != nil {
+		return result, err
+	}
+	if len(result) > maxLength {
+		return "", fmt.Errorf("%v gave a response with length > to %v", endpoint, maxLength)
+	}
+	return result, err
 }
 
 func getMetadataItem(endpoint string) (string, error) {
@@ -82,11 +93,7 @@ func IsDefaultHostname(hostname string) bool {
 }
 
 // HostnameProvider gets the hostname
-func HostnameProvider(hostName string) (string, error) {
-	_, err := ecs.GetUtil()
-	if err == nil || IsDefaultHostname(hostName) {
-		log.Debug("GetHostname trying EC2 metadata...")
-		return GetInstanceID()
-	}
-	return "", nil
+func HostnameProvider() (string, error) {
+	log.Debug("GetHostname trying EC2 metadata...")
+	return GetInstanceID()
 }
