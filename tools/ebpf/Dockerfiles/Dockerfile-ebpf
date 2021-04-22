@@ -1,5 +1,5 @@
 # Used to compile eBPF code
-FROM golang:1.13.12-buster
+FROM golang:1.15.10-buster
 
 ENV GOPATH /go
 
