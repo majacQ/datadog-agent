@@ -1,7 +1,7 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2016-2019 Datadog, Inc.
+// Copyright 2016-present Datadog, Inc.
 
 package azure
 
@@ -12,6 +12,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/DataDog/datadog-agent/pkg/config"
 )
 
 func TestGetHostname(t *testing.T) {
@@ -33,20 +35,62 @@ func TestGetHostname(t *testing.T) {
 }
 
 func TestGetClusterName(t *testing.T) {
-	apiResponse := "MC_aks-kenafeh_aks-kenafeh-eu_westeurope"
-	expectedClusterName := "aks-kenafeh-eu"
-	var lastRequest *http.Request
+	tests := []struct {
+		name    string
+		rgName  string
+		want    string
+		wantErr bool
+	}{
+		{
+			name:    "uppercase prefix",
+			rgName:  "MC_aks-kenafeh_aks-kenafeh-eu_westeurope",
+			want:    "aks-kenafeh-eu",
+			wantErr: false,
+		},
+		{
+			name:    "lowercase prefix",
+			rgName:  "mc_foo-bar-aks-k8s-rg_foo-bar-aks-k8s_westeurope",
+			want:    "foo-bar-aks-k8s",
+			wantErr: false,
+		},
+		{
+			name:    "invalid",
+			rgName:  "unexpected-resource-group-name-format",
+			want:    "",
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var lastRequest *http.Request
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/plain")
+				io.WriteString(w, tt.rgName)
+				lastRequest = r
+			}))
+			defer ts.Close()
+			metadataURL = ts.URL
+			got, err := GetClusterName()
+			assert.Equal(t, tt.wantErr, (err != nil))
+			assert.Equal(t, tt.want, got)
+			assert.Equal(t, lastRequest.URL.Path, "/metadata/instance/compute/resourceGroupName")
+			assert.Equal(t, lastRequest.URL.RawQuery, "api-version=2017-08-01&format=text")
+		})
+	}
+}
+
+func TestGetNTPHosts(t *testing.T) {
+	expectedHosts := []string{"time.windows.com"}
+
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
-		io.WriteString(w, apiResponse)
-		lastRequest = r
+		io.WriteString(w, "test")
 	}))
 	defer ts.Close()
-	metadataURL = ts.URL
 
-	val, err := GetClusterName()
-	assert.Nil(t, err)
-	assert.Equal(t, expectedClusterName, val)
-	assert.Equal(t, lastRequest.URL.Path, "/metadata/instance/compute/resourceGroupName")
-	assert.Equal(t, lastRequest.URL.RawQuery, "api-version=2017-08-01&format=text")
+	metadataURL = ts.URL
+	config.Datadog.Set("cloud_provider_metadata", []string{"azure"})
+	actualHosts := GetNTPHosts()
+
+	assert.Equal(t, expectedHosts, actualHosts)
 }

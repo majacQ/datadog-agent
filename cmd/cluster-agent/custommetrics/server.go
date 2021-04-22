@@ -1,25 +1,24 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2017 Datadog, Inc.
+// Copyright 2017-present Datadog, Inc.
 
 // +build kubeapiserver
 
 package custommetrics
 
 import (
+	"context"
 	"fmt"
 	"net"
 
-	"github.com/kubernetes-incubator/custom-metrics-apiserver/pkg/apiserver"
-	basecmd "github.com/kubernetes-incubator/custom-metrics-apiserver/pkg/cmd"
-	"github.com/kubernetes-incubator/custom-metrics-apiserver/pkg/provider"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/serializer"
-	"k8s.io/apimachinery/pkg/util/wait"
-	genericapiserver "k8s.io/apiserver/pkg/server"
+	"github.com/kubernetes-sigs/custom-metrics-apiserver/pkg/apiserver"
+	basecmd "github.com/kubernetes-sigs/custom-metrics-apiserver/pkg/cmd"
+	"github.com/kubernetes-sigs/custom-metrics-apiserver/pkg/provider"
+	"github.com/spf13/pflag"
 
 	"github.com/DataDog/datadog-agent/pkg/clusteragent/custommetrics"
+	"github.com/DataDog/datadog-agent/pkg/clusteragent/externalmetrics"
 	"github.com/DataDog/datadog-agent/pkg/config"
 	as "github.com/DataDog/datadog-agent/pkg/util/kubernetes/apiserver"
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes/apiserver/common"
@@ -34,19 +33,37 @@ type DatadogMetricsAdapter struct {
 	basecmd.AdapterBase
 }
 
-// StartServer creates and start a k8s custom metrics API server
-func StartServer() error {
-	cmd = &DatadogMetricsAdapter{}
-	cmd.Flags()
+const (
+	metricsServerConf string = "external_metrics_provider.config"
+)
 
-	provider, err := cmd.makeProviderOrDie()
+// RunServer creates and start a k8s custom metrics API server
+func RunServer(ctx context.Context, apiCl *as.APIClient) error {
+	defer clearServerResources()
+	if apiCl == nil {
+		return fmt.Errorf("unable to run server with nil APIClient")
+	}
+
+	cmd = &DatadogMetricsAdapter{}
+	cmd.Name = "datadog-custom-metrics-adapter"
+	cmd.FlagSet = pflag.NewFlagSet(cmd.Name, pflag.ExitOnError)
+
+	var c []string
+	for k, v := range config.Datadog.GetStringMapString(metricsServerConf) {
+		c = append(c, fmt.Sprintf("--%s=%s", k, v))
+	}
+
+	if err := cmd.Flags().Parse(c); err != nil {
+		return err
+	}
+
+	provider, err := cmd.makeProviderOrDie(ctx, apiCl)
 	if err != nil {
 		return err
 	}
 
 	// TODO when implementing the custom metrics provider, add cmd.WithCustomMetrics(provider) here
 	cmd.WithExternalMetrics(provider)
-	cmd.Name = "datadog-custom-metrics-adapter"
 
 	conf, err := cmd.Config()
 	if err != nil {
@@ -57,26 +74,14 @@ func StartServer() error {
 	if err != nil {
 		return err
 	}
-
-	return server.GenericAPIServer.PrepareRun().Run(wait.NeverStop)
+	// TODO Add extra logic to only tear down the External Metrics Server if only some components fail.
+	return server.GenericAPIServer.PrepareRun().Run(ctx.Done())
 }
 
-func (a *DatadogMetricsAdapter) makeProviderOrDie() (provider.ExternalMetricsProvider, error) {
+func (a *DatadogMetricsAdapter) makeProviderOrDie(ctx context.Context, apiCl *as.APIClient) (provider.ExternalMetricsProvider, error) {
 	client, err := a.DynamicClient()
 	if err != nil {
 		log.Infof("Unable to construct dynamic client: %v", err)
-		return nil, err
-	}
-	apiCl, err := as.GetAPIClient()
-	if err != nil {
-		log.Errorf("Could not build API Client: %v", err)
-		return nil, err
-	}
-
-	datadogHPAConfigMap := custommetrics.GetConfigmapName()
-	store, err := custommetrics.NewConfigMapStore(apiCl.Cl, common.GetResourcesNamespace(), datadogHPAConfigMap)
-	if err != nil {
-		log.Errorf("Unable to create ConfigMap Store: %v", err)
 		return nil, err
 	}
 
@@ -86,48 +91,42 @@ func (a *DatadogMetricsAdapter) makeProviderOrDie() (provider.ExternalMetricsPro
 		return nil, err
 	}
 
-	return custommetrics.NewDatadogProvider(client, mapper, store), nil
+	if config.Datadog.GetBool("external_metrics_provider.use_datadogmetric_crd") {
+		return externalmetrics.NewDatadogMetricProvider(ctx, apiCl)
+	}
+
+	datadogHPAConfigMap := custommetrics.GetConfigmapName()
+	store, err := custommetrics.NewConfigMapStore(apiCl.Cl, common.GetResourcesNamespace(), datadogHPAConfigMap)
+	if err != nil {
+		log.Errorf("Unable to create ConfigMap Store: %v", err)
+		return nil, err
+	}
+
+	return custommetrics.NewDatadogProvider(ctx, client, mapper, store), nil
 }
 
 // Config creates the configuration containing the required parameters to communicate with the APIServer as an APIService
-func (o *DatadogMetricsAdapter) Config() (*apiserver.Config, error) {
-	o.SecureServing.ServerCert.CertDirectory = "/etc/datadog-agent/certificates"
-	o.SecureServing.BindPort = config.Datadog.GetInt("external_metrics_provider.port")
-
-	if err := o.SecureServing.MaybeDefaultWithSelfSignedCerts("localhost", nil, []net.IP{net.ParseIP("127.0.0.1")}); err != nil {
+func (a *DatadogMetricsAdapter) Config() (*apiserver.Config, error) {
+	if a.FlagSet.Lookup("cert-dir").Changed == false {
+		// Ensure backward compatibility. Was hardcoded before.
+		// Config flag is now to be added to the map `external_metrics_provider.config` as, `cert-dir`.
+		a.SecureServing.ServerCert.CertDirectory = "/etc/datadog-agent/certificates"
+	}
+	if a.FlagSet.Lookup("secure-port").Changed == false {
+		// Ensure backward compatibility. 443 by default, but will error out if incorrectly set.
+		// refer to apiserver code in k8s.io/apiserver/pkg/server/option/serving.go
+		a.SecureServing.BindPort = config.Datadog.GetInt("external_metrics_provider.port")
+	}
+	if err := a.SecureServing.MaybeDefaultWithSelfSignedCerts("localhost", nil, []net.IP{net.ParseIP("127.0.0.1")}); err != nil {
 		log.Errorf("Failed to create self signed AuthN/Z configuration %#v", err)
 		return nil, fmt.Errorf("error creating self-signed certificates: %v", err)
 	}
-
-	scheme := runtime.NewScheme()
-	codecs := serializer.NewCodecFactory(scheme)
-	serverConfig := genericapiserver.NewConfig(codecs)
-
-	err := o.SecureServing.ApplyTo(serverConfig)
-	if err != nil {
-		log.Errorf("Error while converting SecureServing type %v", err)
-		return nil, err
-	}
-
-	// Get the certificates from the extension-apiserver-authentication ConfigMap
-	if err := o.Authentication.ApplyTo(&serverConfig.Authentication, serverConfig.SecureServing, nil); err != nil {
-		log.Errorf("Could not create Authentication configuration: %v", err)
-		return nil, err
-	}
-
-	if err := o.Authorization.ApplyTo(&serverConfig.Authorization); err != nil {
-		log.Infof("Could not create Authorization configuration: %v", err)
-		return nil, err
-	}
-
-	return &apiserver.Config{
-		GenericConfig: serverConfig,
-	}, nil
+	return a.CustomMetricsAdapterServerOptions.Config()
 }
 
-// StopServer closes the connection and the server
+// clearServerResources closes the connection and the server
 // stops listening to new commands.
-func StopServer() {
+func clearServerResources() {
 	if stopCh != nil {
 		close(stopCh)
 	}

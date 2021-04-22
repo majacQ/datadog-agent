@@ -11,6 +11,7 @@ func TestBasicCache(t *testing.T) {
 		"a": 1,
 		"b": "dos",
 		"c": struct{}{},
+		"d": []string{"42", "platypus"},
 	}
 
 	c := NewBasicCache()
@@ -20,18 +21,27 @@ func TestBasicCache(t *testing.T) {
 	assert.Equal(t, len(m), c.Size())
 
 	for k, v := range m {
-		cached, err := c.Get(k)
-		assert.Nil(t, err)
+		cached, found := c.Get(k)
+		assert.True(t, found)
 		assert.Equal(t, v, cached)
 	}
 
-	_, err := c.Get("notincache")
-	assert.NotNil(t, err)
+	_, found := c.Get("notincache")
+	assert.False(t, found)
 
 	items := c.Items()
 	for k, v := range items {
 		assert.Equal(t, m[k], v)
 	}
+
+	wombat := "wombat"
+	initialTimestamp := c.GetModified()
+	c.modified = 0
+	c.Add("d", wombat)
+	cached, found := c.Get("d")
+	assert.True(t, found)
+	assert.Equal(t, cached, wombat)
+	assert.GreaterOrEqual(t, c.GetModified(), initialTimestamp)
 
 	for k := range m {
 		c.Remove(k)

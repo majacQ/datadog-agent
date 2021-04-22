@@ -1,7 +1,7 @@
 # Cookbook Name:: dd-agent-imprt-conf
 # Recipe:: default
 #
-# Copyright (C) 2013 Datadog
+# Copyright (C) 2013-present Datadog
 #
 # All rights reserved - Do Not Redistribute
 #
@@ -10,11 +10,14 @@
 # the Agent 6 has already been setup.
 # We just have to run the command.
 
+
 if node['platform_family'] != 'windows'
+  include_recipe 'dd-agent-import-conf::_datadog-agent-6'
+
   execute "import-command" do
     command "sudo -u dd-agent -- /opt/datadog-agent/bin/agent/agent import /etc/dd-agent/ /etc/datadog-agent/"
     action :run
-    notifies :restart, 'service[datadog-agent]'
+    notifies :restart, 'service[datadog-agent-6]'
   end
 end
 

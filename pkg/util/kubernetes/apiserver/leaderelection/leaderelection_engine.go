@@ -1,16 +1,18 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2016-2019 Datadog, Inc.
+// Copyright 2016-present Datadog, Inc.
 
 // +build kubeapiserver
 
 package leaderelection
 
 import (
+	"context"
 	"encoding/json"
+	"strconv"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -18,11 +20,12 @@ import (
 	rl "k8s.io/client-go/tools/leaderelection/resourcelock"
 	"k8s.io/client-go/tools/record"
 
+	"github.com/DataDog/datadog-agent/pkg/util/kubernetes/apiserver/leaderelection/metrics"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
 func (le *LeaderEngine) getCurrentLeader() (string, *v1.ConfigMap, error) {
-	configMap, err := le.coreClient.ConfigMaps(le.LeaderNamespace).Get(le.LeaseName, metav1.GetOptions{})
+	configMap, err := le.coreClient.ConfigMaps(le.LeaderNamespace).Get(context.TODO(), le.LeaseName, metav1.GetOptions{})
 	if err != nil {
 		return "", nil, err
 	}
@@ -44,21 +47,21 @@ func (le *LeaderEngine) getCurrentLeader() (string, *v1.ConfigMap, error) {
 // If `namespace`/`election` does not exist, it is created.
 func (le *LeaderEngine) newElection() (*ld.LeaderElector, error) {
 	// We first want to check if the ConfigMap the Leader Election is based on exists.
-	_, err := le.coreClient.ConfigMaps(le.LeaderNamespace).Get(le.LeaseName, metav1.GetOptions{})
+	_, err := le.coreClient.ConfigMaps(le.LeaderNamespace).Get(context.TODO(), le.LeaseName, metav1.GetOptions{})
 
 	if err != nil {
 		if errors.IsNotFound(err) == false {
 			return nil, err
 		}
 
-		_, err = le.coreClient.ConfigMaps(le.LeaderNamespace).Create(&v1.ConfigMap{
+		_, err = le.coreClient.ConfigMaps(le.LeaderNamespace).Create(context.TODO(), &v1.ConfigMap{
 			TypeMeta: metav1.TypeMeta{
 				Kind: "ConfigMap",
 			},
 			ObjectMeta: metav1.ObjectMeta{
 				Name: le.LeaseName,
 			},
-		})
+		}, metav1.CreateOptions{})
 		if err != nil && !errors.IsConflict(err) {
 			return nil, err
 		}
@@ -71,26 +74,20 @@ func (le *LeaderEngine) newElection() (*ld.LeaderElector, error) {
 	log.Debugf("Current registered leader is %q, building leader elector %q as candidate", currentLeader, le.HolderIdentity)
 	callbacks := ld.LeaderCallbacks{
 		OnNewLeader: func(identity string) {
-			le.leaderIdentityMutex.Lock()
-			le.leaderIdentity = identity
-			le.leaderIdentityMutex.Unlock()
-
+			le.updateLeaderIdentity(identity)
+			le.reportLeaderMetric(false)
 			log.Infof("New leader %q", identity)
 		},
-		OnStartedLeading: func(stop <-chan struct{}) {
-			le.leaderIdentityMutex.Lock()
-			le.leaderIdentity = le.HolderIdentity
-			le.leaderIdentityMutex.Unlock()
-
+		OnStartedLeading: func(ctx context.Context) {
+			le.updateLeaderIdentity(le.HolderIdentity)
+			le.reportLeaderMetric(true)
 			log.Infof("Started leading as %q...", le.HolderIdentity)
 		},
 		// OnStoppedLeading shouldn't be called unless the election is lost. This could happen if
 		// we lose connection to the apiserver for the duration of the lease.
 		OnStoppedLeading: func() {
-			le.leaderIdentityMutex.Lock()
-			le.leaderIdentity = ""
-			le.leaderIdentityMutex.Unlock()
-
+			le.updateLeaderIdentity("")
+			le.reportLeaderMetric(false)
 			log.Infof("Stopped leading %q", le.HolderIdentity)
 		},
 	}
@@ -105,11 +102,13 @@ func (le *LeaderEngine) newElection() (*ld.LeaderElector, error) {
 		Identity:      le.HolderIdentity,
 		EventRecorder: evRec,
 	}
+
 	leaderElectorInterface, err := rl.New(
 		rl.ConfigMapsResourceLock,
 		configMap.ObjectMeta.Namespace,
 		configMap.ObjectMeta.Name,
 		le.coreClient,
+		nil, // relying on CM so unnecessary.
 		resourceLockConfig,
 	)
 	if err != nil {
@@ -124,4 +123,21 @@ func (le *LeaderEngine) newElection() (*ld.LeaderElector, error) {
 		Callbacks:     callbacks,
 	}
 	return ld.NewLeaderElector(electionConfig)
+}
+
+// updateLeaderIdentity sets leaderIdentity
+func (le *LeaderEngine) updateLeaderIdentity(identity string) {
+	le.leaderIdentityMutex.Lock()
+	defer le.leaderIdentityMutex.Unlock()
+	le.leaderIdentity = identity
+}
+
+// reportLeaderMetric updates the label of the leader metric on every leadership change
+func (le *LeaderEngine) reportLeaderMetric(isLeader bool) {
+	// We want to make sure only one (the latest) context is exposed for this metric
+	// Delete previous run metric
+	le.leaderMetric.Delete(metrics.JoinLeaderValue, "false")
+	le.leaderMetric.Delete(metrics.JoinLeaderValue, "true")
+
+	le.leaderMetric.Set(1.0, metrics.JoinLeaderValue, strconv.FormatBool(isLeader))
 }

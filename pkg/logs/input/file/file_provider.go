@@ -1,7 +1,7 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2016-2019 Datadog, Inc.
+// Copyright 2016-present Datadog, Inc.
 
 package file
 
@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 
 	"github.com/DataDog/datadog-agent/pkg/logs/status"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
@@ -24,16 +23,30 @@ const openFilesLimitWarningType = "open_files_limit_warning"
 
 // File represents a file to tail
 type File struct {
-	Path   string
-	Source *config.LogSource
+	Path string
+	// IsWildcardPath is set to true when the File has been discovered
+	// in a directory with wildcard(s) in the configuration.
+	IsWildcardPath bool
+	Source         *config.LogSource
 }
 
 // NewFile returns a new File
-func NewFile(path string, source *config.LogSource) *File {
+func NewFile(path string, source *config.LogSource, isWildcardPath bool) *File {
 	return &File{
-		Path:   path,
-		Source: source,
+		Path:           path,
+		Source:         source,
+		IsWildcardPath: isWildcardPath,
 	}
+}
+
+// GetScanKey returns a key used by the scanner to index the scanned file.
+// If it is a file scanned for a container, it will use the format: <filepath>/<container_id>
+// Otherwise, it will simply use the format: <filepath>
+func (t *File) GetScanKey() string {
+	if t.Source != nil && t.Source.Config != nil && t.Source.Config.Identifier != "" {
+		return fmt.Sprintf("%s/%s", t.Path, t.Source.Config.Identifier)
+	}
+	return t.Path
 }
 
 // Provider implements the logic to retrieve at most filesLimit Files defined in sources
@@ -63,9 +76,10 @@ func (p *Provider) FilesToTail(sources []*config.LogSource) []*File {
 		source := sources[i]
 		tailedFileCounter := 0
 		files, err := p.CollectFiles(source)
+		isWildcardPath := config.ContainsWildcard(source.Config.Path)
 		if err != nil {
 			source.Status.Error(err)
-			if p.containsWildcard(source.Config.Path) {
+			if isWildcardPath {
 				source.Messages.AddMessage(source.Config.Path, fmt.Sprintf("%d files tailed out of %d files matching", tailedFileCounter, len(files)))
 			}
 			if shouldLogErrors {
@@ -91,7 +105,7 @@ func (p *Provider) FilesToTail(sources []*config.LogSource) []*File {
 			status.RemoveGlobalWarning(openFilesLimitWarningType)
 		}
 
-		if p.containsWildcard(source.Config.Path) {
+		if isWildcardPath {
 			source.Messages.AddMessage(source.Config.Path, fmt.Sprintf("%d files tailed out of %d files matching", tailedFileCounter, len(files)))
 		}
 	}
@@ -111,9 +125,9 @@ func (p *Provider) CollectFiles(source *config.LogSource) ([]*File, error) {
 	switch {
 	case fileExists:
 		return []*File{
-			NewFile(path, source),
+			NewFile(path, source, false),
 		}, nil
-	case p.containsWildcard(path):
+	case config.ContainsWildcard(path):
 		pattern := path
 		return p.searchFiles(pattern, source)
 	default:
@@ -147,8 +161,27 @@ func (p *Provider) searchFiles(pattern string, source *config.LogSource) ([]*Fil
 	sort.SliceStable(paths, func(i, j int) bool {
 		return filepath.Base(paths[i]) > filepath.Base(paths[j])
 	})
+
+	// Resolve excluded path(s)
+	excludedPaths := make(map[string]int)
+	for _, excludePattern := range source.Config.ExcludePaths {
+		excludedGlob, err := filepath.Glob(excludePattern)
+		if err != nil {
+			return nil, fmt.Errorf("malformed exclusion pattern: %s, %s", excludePattern, err)
+		}
+		for _, excludedPath := range excludedGlob {
+			log.Debugf("Adding excluded path: %s", excludedPath)
+			excludedPaths[excludedPath]++
+			if excludedPaths[excludedPath] > 1 {
+				log.Debugf("Overlapping excluded path: %s", excludedPath)
+			}
+		}
+	}
+
 	for _, path := range paths {
-		files = append(files, NewFile(path, source))
+		if excludedPaths[path] == 0 {
+			files = append(files, NewFile(path, source, true))
+		}
 	}
 	return files, nil
 }
@@ -161,9 +194,4 @@ func (p *Provider) exists(filePath string) bool {
 		return false
 	}
 	return true
-}
-
-// containsWildcard returns true if the path contains any wildcard character
-func (p *Provider) containsWildcard(path string) bool {
-	return strings.ContainsAny(path, "*?[")
 }

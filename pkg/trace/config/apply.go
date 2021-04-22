@@ -1,3 +1,8 @@
+// Unless explicitly stated otherwise all files in this repository are licensed
+// under the Apache License Version 2.0.
+// This product includes software developed at Datadog (https://www.datadoghq.com/).
+// Copyright 2016-present Datadog, Inc.
+
 package config
 
 import (
@@ -6,13 +11,12 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/DataDog/datadog-agent/pkg/config"
 	"github.com/DataDog/datadog-agent/pkg/trace/osutil"
-	"github.com/DataDog/datadog-agent/pkg/trace/writer/backoff"
-	writerconfig "github.com/DataDog/datadog-agent/pkg/trace/writer/config"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
@@ -27,6 +31,13 @@ type ObfuscationConfig struct {
 
 	// Mongo holds the obfuscation configuration for MongoDB queries.
 	Mongo JSONObfuscationConfig `mapstructure:"mongodb"`
+
+	// SQLExecPlan holds the obfuscation configuration for SQL Exec Plans. This is strictly for safety related obfuscation,
+	// not normalization. Normalization of exec plans is configured in SQLExecPlanNormalize.
+	SQLExecPlan JSONObfuscationConfig `mapstructure:"sql_exec_plan"`
+
+	// SQLExecPlanNormalize holds the normalization configuration for SQL Exec Plans.
+	SQLExecPlanNormalize JSONObfuscationConfig `mapstructure:"sql_exec_plan_normalize"`
 
 	// HTTP holds the obfuscation settings for HTTP URLs.
 	HTTP HTTPObfuscationConfig `mapstructure:"http"`
@@ -47,10 +58,10 @@ type ObfuscationConfig struct {
 // HTTPObfuscationConfig holds the configuration settings for HTTP obfuscation.
 type HTTPObfuscationConfig struct {
 	// RemoveQueryStrings determines query strings to be removed from HTTP URLs.
-	RemoveQueryString bool `mapstructure:"remove_query_string"`
+	RemoveQueryString bool `mapstructure:"remove_query_string" json:"remove_query_string"`
 
 	// RemovePathDigits determines digits in path segments to be obfuscated.
-	RemovePathDigits bool `mapstructure:"remove_paths_with_digits"`
+	RemovePathDigits bool `mapstructure:"remove_paths_with_digits" json:"remove_path_digits"`
 }
 
 // Enablable can represent any option that has an "enabled" boolean sub-field.
@@ -67,6 +78,10 @@ type JSONObfuscationConfig struct {
 	// KeepValues will specify a set of keys for which their values will
 	// not be obfuscated.
 	KeepValues []string `mapstructure:"keep_values"`
+
+	// ObfuscateSQLValues will specify a set of keys for which their values
+	// will be passed through SQL obfuscation
+	ObfuscateSQLValues []string `mapstructure:"obfuscate_sql_values"`
 }
 
 // ReplaceRule specifies a replace rule.
@@ -87,32 +102,19 @@ type ReplaceRule struct {
 	Repl string `mapstructure:"repl"`
 }
 
-type traceWriter struct {
-	MaxSpansPerPayload     int                    `mapstructure:"max_spans_per_payload"`
-	FlushPeriod            float64                `mapstructure:"flush_period_seconds"`
-	UpdateInfoPeriod       int                    `mapstructure:"update_info_period_seconds"`
-	QueueablePayloadSender queueablePayloadSender `mapstructure:"queue"`
-}
+// WriterConfig specifies configuration for an API writer.
+type WriterConfig struct {
+	// ConnectionLimit specifies the maximum number of concurrent outgoing
+	// connections allowed for the sender.
+	ConnectionLimit int `mapstructure:"connection_limit"`
 
-type serviceWriter struct {
-	UpdateInfoPeriod       int                    `mapstructure:"update_info_period_seconds"`
-	FlushPeriod            int                    `mapstructure:"flush_period_seconds"`
-	QueueablePayloadSender queueablePayloadSender `mapstructure:"queue"`
-}
+	// QueueSize specifies the maximum number or payloads allowed to be queued
+	// in the sender.
+	QueueSize int `mapstructure:"queue_size"`
 
-type statsWriter struct {
-	MaxEntriesPerPayload   int                    `mapstructure:"max_entries_per_payload"`
-	UpdateInfoPeriod       int                    `mapstructure:"update_info_period_seconds"`
-	QueueablePayloadSender queueablePayloadSender `mapstructure:"queue"`
-}
-
-type queueablePayloadSender struct {
-	MaxAge            int   `mapstructure:"max_age_seconds"`
-	MaxQueuedBytes    int64 `mapstructure:"max_bytes"`
-	MaxQueuedPayloads int   `mapstructure:"max_payloads"`
-	BackoffDuration   int   `mapstructure:"exp_backoff_max_duration_seconds"`
-	BackoffBase       int   `mapstructure:"exp_backoff_base_milliseconds"`
-	BackoffGrowth     int   `mapstructure:"exp_backoff_growth_base"`
+	// FlushPeriodSeconds specifies the frequency at which the writer's buffer
+	// will be flushed to the sender, in seconds. Fractions are permitted.
+	FlushPeriodSeconds float64 `mapstructure:"flush_period_seconds"`
 }
 
 func (c *AgentConfig) applyDatadogConfig() error {
@@ -120,7 +122,7 @@ func (c *AgentConfig) applyDatadogConfig() error {
 		c.Endpoints = []*Endpoint{{}}
 	}
 	if config.Datadog.IsSet("api_key") {
-		c.Endpoints[0].APIKey = config.Datadog.GetString("api_key")
+		c.Endpoints[0].APIKey = config.SanitizeAPIKey(config.Datadog.GetString("api_key"))
 	}
 	if config.Datadog.IsSet("hostname") {
 		c.Hostname = config.Datadog.GetString("hostname")
@@ -142,24 +144,29 @@ func (c *AgentConfig) applyDatadogConfig() error {
 			log.Infof("'site' and 'apm_dd_url' are both set, using endpoint: %q", host)
 		}
 	}
-	for url, keys := range config.Datadog.GetStringMapStringSlice("apm_config.additional_endpoints") {
-		if len(keys) == 0 {
-			log.Errorf("'additional_endpoints' entries must have at least one API key present")
-			continue
-		}
-		for _, key := range keys {
-			c.Endpoints = append(c.Endpoints, &Endpoint{Host: url, APIKey: key})
+	if config.Datadog.IsSet("apm_config.additional_endpoints") {
+		for url, keys := range config.Datadog.GetStringMapStringSlice("apm_config.additional_endpoints") {
+			if len(keys) == 0 {
+				log.Errorf("'additional_endpoints' entries must have at least one API key present")
+				continue
+			}
+			for _, key := range keys {
+				key = config.SanitizeAPIKey(key)
+				c.Endpoints = append(c.Endpoints, &Endpoint{Host: url, APIKey: key})
+			}
 		}
 	}
 
-	proxyList := config.Datadog.GetStringSlice("proxy.no_proxy")
-	noProxy := make(map[string]bool, len(proxyList))
-	for _, host := range proxyList {
-		// map of hosts that need to be skipped by proxy
-		noProxy[host] = true
-	}
-	for _, e := range c.Endpoints {
-		e.NoProxy = noProxy[e.Host]
+	if config.Datadog.IsSet("proxy.no_proxy") {
+		proxyList := config.Datadog.GetStringSlice("proxy.no_proxy")
+		noProxy := make(map[string]bool, len(proxyList))
+		for _, host := range proxyList {
+			// map of hosts that need to be skipped by proxy
+			noProxy[host] = true
+		}
+		for _, e := range c.Endpoints {
+			e.NoProxy = noProxy[e.Host]
+		}
 	}
 	if addr := config.Datadog.GetString("proxy.https"); addr != "" {
 		url, err := url.Parse(addr)
@@ -181,9 +188,24 @@ func (c *AgentConfig) applyDatadogConfig() error {
 	}
 	if config.Datadog.IsSet("apm_config.env") {
 		c.DefaultEnv = config.Datadog.GetString("apm_config.env")
+		log.Debugf("Setting DefaultEnv to %q (from apm_config.env)", c.DefaultEnv)
+	} else if config.Datadog.IsSet("env") {
+		c.DefaultEnv = config.Datadog.GetString("env")
+		log.Debugf("Setting DefaultEnv to %q (from 'env' config option)", c.DefaultEnv)
+	} else if config.Datadog.IsSet("tags") {
+		for _, tag := range config.Datadog.GetStringSlice("tags") {
+			if strings.HasPrefix(tag, "env:") {
+				c.DefaultEnv = strings.TrimPrefix(tag, "env:")
+				log.Debugf("Setting DefaultEnv to %q (from `env:` entry under the 'tags' config option: %q)", c.DefaultEnv, tag)
+				break
+			}
+		}
 	}
 	if config.Datadog.IsSet("apm_config.receiver_port") {
 		c.ReceiverPort = config.Datadog.GetInt("apm_config.receiver_port")
+	}
+	if config.Datadog.IsSet("apm_config.receiver_socket") {
+		c.ReceiverSocket = config.Datadog.GetString("apm_config.receiver_socket")
 	}
 	if config.Datadog.IsSet("apm_config.connection_limit") {
 		c.ConnectionLimit = config.Datadog.GetInt("apm_config.connection_limit")
@@ -195,16 +217,19 @@ func (c *AgentConfig) applyDatadogConfig() error {
 		c.MaxEPS = config.Datadog.GetFloat64("apm_config.max_events_per_second")
 	}
 	if config.Datadog.IsSet("apm_config.max_traces_per_second") {
-		c.MaxTPS = config.Datadog.GetFloat64("apm_config.max_traces_per_second")
+		c.TargetTPS = config.Datadog.GetFloat64("apm_config.max_traces_per_second")
 	}
-	if config.Datadog.IsSet("apm_config.ignore_resources") {
-		c.Ignore["resource"] = config.Datadog.GetStringSlice("apm_config.ignore_resources")
+	if k := "apm_config.ignore_resources"; config.Datadog.IsSet(k) {
+		c.Ignore["resource"] = config.Datadog.GetStringSlice(k)
 	}
-
-	if config.Datadog.IsSet("apm_config.replace_tags") {
+	if k := "apm_config.max_payload_size"; config.Datadog.IsSet(k) {
+		c.MaxRequestBytes = config.Datadog.GetInt64(k)
+	}
+	if k := "apm_config.replace_tags"; config.Datadog.IsSet(k) {
 		rt := make([]*ReplaceRule, 0)
-		err := config.Datadog.UnmarshalKey("apm_config.replace_tags", &rt)
-		if err == nil {
+		if err := config.Datadog.UnmarshalKey(k, &rt); err != nil {
+			log.Errorf("Bad format for %q it should be of the form '[{\"name\": \"tag_name\",\"pattern\":\"pattern\",\"repl\":\"replace_str\"}]', error: %v", "apm_config.replace_tags", err)
+		} else {
 			err := compileReplaceRules(rt)
 			if err != nil {
 				osutil.Exitf("replace_tags: %s", err)
@@ -213,15 +238,20 @@ func (c *AgentConfig) applyDatadogConfig() error {
 		}
 	}
 
-	if config.Datadog.IsSet("bind_host") {
-		host := config.Datadog.GetString("bind_host")
-		c.StatsdHost = host
-		c.ReceiverHost = host
-	}
-	if config.Datadog.IsSet("apm_config.apm_non_local_traffic") {
-		if config.Datadog.GetBool("apm_config.apm_non_local_traffic") {
+	if config.Datadog.IsSet("bind_host") || config.Datadog.IsSet("apm_config.apm_non_local_traffic") {
+		if config.Datadog.IsSet("bind_host") {
+			host := config.Datadog.GetString("bind_host")
+			c.StatsdHost = host
+			c.ReceiverHost = host
+		}
+
+		if config.Datadog.IsSet("apm_config.apm_non_local_traffic") && config.Datadog.GetBool("apm_config.apm_non_local_traffic") {
 			c.ReceiverHost = "0.0.0.0"
 		}
+	} else if config.IsContainerized() {
+		// Automatically activate non local traffic in containerized environment if no explicit config set
+		log.Info("Activating non-local traffic automatically in containerized environment, trace-agent will listen on 0.0.0.0")
+		c.ReceiverHost = "0.0.0.0"
 	}
 
 	if config.Datadog.IsSet("apm_config.obfuscation") {
@@ -235,6 +265,19 @@ func (c *AgentConfig) applyDatadogConfig() error {
 		}
 	}
 
+	if config.Datadog.IsSet("apm_config.filter_tags.require") {
+		tags := config.Datadog.GetStringSlice("apm_config.filter_tags.require")
+		for _, tag := range tags {
+			c.RequireTags = append(c.RequireTags, splitTag(tag))
+		}
+	}
+	if config.Datadog.IsSet("apm_config.filter_tags.reject") {
+		tags := config.Datadog.GetStringSlice("apm_config.filter_tags.reject")
+		for _, tag := range tags {
+			c.RejectTags = append(c.RejectTags, splitTag(tag))
+		}
+	}
+
 	// undocumented
 	if config.Datadog.IsSet("apm_config.max_cpu_percent") {
 		c.MaxCPU = config.Datadog.GetFloat64("apm_config.max_cpu_percent") / 100
@@ -242,14 +285,22 @@ func (c *AgentConfig) applyDatadogConfig() error {
 	if config.Datadog.IsSet("apm_config.max_memory") {
 		c.MaxMemory = config.Datadog.GetFloat64("apm_config.max_memory")
 	}
-	if config.Datadog.IsSet("apm_config.max_connections") {
-		c.MaxConnections = config.Datadog.GetInt("apm_config.max_connections")
-	}
 
-	// undocumented
-	c.ServiceWriterConfig = readServiceWriterConfigYaml()
-	c.StatsWriterConfig = readStatsWriterConfigYaml()
-	c.TraceWriterConfig = readTraceWriterConfigYaml()
+	// undocumented writers
+	for key, cfg := range map[string]*WriterConfig{
+		"apm_config.trace_writer": c.TraceWriter,
+		"apm_config.stats_writer": c.StatsWriter,
+	} {
+		if err := config.Datadog.UnmarshalKey(key, cfg); err != nil {
+			log.Errorf("Error reading writer config %q: %v", key, err)
+		}
+	}
+	if config.Datadog.IsSet("apm_config.connection_reset_interval") {
+		c.ConnectionResetInterval = getDuration(config.Datadog.GetInt("apm_config.connection_reset_interval"))
+	}
+	if config.Datadog.IsSet("apm_config.sync_flushing") {
+		c.SynchronousFlushing = config.Datadog.GetBool("apm_config.sync_flushing")
+	}
 
 	// undocumented deprecated
 	if config.Datadog.IsSet("apm_config.analyzed_rate_by_service") {
@@ -263,22 +314,21 @@ func (c *AgentConfig) applyDatadogConfig() error {
 		}
 	}
 	// undocumeted
-	if config.Datadog.IsSet("apm_config.analyzed_spans") {
-		rateBySpan := make(map[string]float64)
-		if err := config.Datadog.UnmarshalKey("apm_config.analyzed_spans", &rateBySpan); err != nil {
-			return err
-		}
-		for key, rate := range rateBySpan {
+	if k := "apm_config.analyzed_spans"; config.Datadog.IsSet(k) {
+		for key, rate := range config.Datadog.GetStringMap("apm_config.analyzed_spans") {
 			serviceName, operationName, err := parseServiceAndOp(key)
 			if err != nil {
-				log.Errorf("error parsing names: %v", err)
+				log.Errorf("Error parsing names: %v", err)
 				continue
 			}
-
-			if _, ok := c.AnalyzedSpansByService[serviceName]; !ok {
-				c.AnalyzedSpansByService[serviceName] = make(map[string]float64)
+			if floatrate, err := toFloat64(rate); err != nil {
+				log.Errorf("Invalid value for apm_config.analyzed_spans: %v", err)
+			} else {
+				if _, ok := c.AnalyzedSpansByService[serviceName]; !ok {
+					c.AnalyzedSpansByService[serviceName] = make(map[string]float64)
+				}
+				c.AnalyzedSpansByService[serviceName][operationName] = floatrate
 			}
-			c.AnalyzedSpansByService[serviceName][operationName] = rate
 		}
 	}
 
@@ -287,7 +337,17 @@ func (c *AgentConfig) applyDatadogConfig() error {
 		c.DDAgentBin = config.Datadog.GetString("apm_config.dd_agent_bin")
 	}
 
-	return c.loadDeprecatedValues()
+	if err := c.loadDeprecatedValues(); err != nil {
+		return err
+	}
+
+	if strings.ToLower(c.LogLevel) == "debug" && !config.Datadog.IsSet("apm_config.log_throttling") {
+		// if we are in "debug mode" and log throttling behavior was not
+		// set by the user, disable it
+		c.LogThrottling = false
+	}
+
+	return nil
 }
 
 // loadDeprecatedValues loads a set of deprecated values which are kept for
@@ -296,20 +356,13 @@ func (c *AgentConfig) applyDatadogConfig() error {
 func (c *AgentConfig) loadDeprecatedValues() error {
 	cfg := config.Datadog
 	if cfg.IsSet("apm_config.api_key") {
-		c.Endpoints[0].APIKey = config.Datadog.GetString("apm_config.api_key")
+		c.Endpoints[0].APIKey = config.SanitizeAPIKey(config.Datadog.GetString("apm_config.api_key"))
 	}
 	if cfg.IsSet("apm_config.log_level") {
 		c.LogLevel = config.Datadog.GetString("apm_config.log_level")
 	}
-	if v := cfg.GetString("apm_config.extra_aggregators"); len(v) > 0 {
-		aggs, err := splitString(v, ',')
-		if err != nil {
-			return err
-		}
-		c.ExtraAggregators = append(c.ExtraAggregators, aggs...)
-	}
-	if !cfg.GetBool("apm_config.log_throttling") {
-		c.LogThrottlingEnabled = false
+	if cfg.IsSet("apm_config.log_throttling") {
+		c.LogThrottling = cfg.GetBool("apm_config.log_throttling")
 	}
 	if cfg.IsSet("apm_config.bucket_size_seconds") {
 		d := time.Duration(cfg.GetInt("apm_config.bucket_size_seconds"))
@@ -338,93 +391,6 @@ func (c *AgentConfig) addReplaceRule(tag, pattern, repl string) {
 		Re:      re,
 		Repl:    repl,
 	})
-}
-
-func readServiceWriterConfigYaml() writerconfig.ServiceWriterConfig {
-	w := serviceWriter{}
-	c := writerconfig.DefaultServiceWriterConfig()
-
-	if err := config.Datadog.UnmarshalKey("apm_config.service_writer", &w); err == nil {
-		if w.FlushPeriod > 0 {
-			c.FlushPeriod = getDuration(w.FlushPeriod)
-		}
-		if w.UpdateInfoPeriod > 0 {
-			c.UpdateInfoPeriod = getDuration(w.UpdateInfoPeriod)
-		}
-		c.SenderConfig = readQueueablePayloadSenderConfigYaml(w.QueueablePayloadSender)
-	}
-	return c
-}
-
-func readStatsWriterConfigYaml() writerconfig.StatsWriterConfig {
-	w := statsWriter{}
-	c := writerconfig.DefaultStatsWriterConfig()
-
-	if err := config.Datadog.UnmarshalKey("apm_config.stats_writer", &w); err == nil {
-		if w.MaxEntriesPerPayload > 0 {
-			c.MaxEntriesPerPayload = w.MaxEntriesPerPayload
-		}
-		if w.UpdateInfoPeriod > 0 {
-			c.UpdateInfoPeriod = getDuration(w.UpdateInfoPeriod)
-		}
-		c.SenderConfig = readQueueablePayloadSenderConfigYaml(w.QueueablePayloadSender)
-	}
-	return c
-}
-
-func readTraceWriterConfigYaml() writerconfig.TraceWriterConfig {
-	w := traceWriter{}
-	c := writerconfig.DefaultTraceWriterConfig()
-
-	if err := config.Datadog.UnmarshalKey("apm_config.trace_writer", &w); err == nil {
-		if w.MaxSpansPerPayload > 0 {
-			c.MaxSpansPerPayload = w.MaxSpansPerPayload
-		}
-		if w.FlushPeriod > 0 {
-			c.FlushPeriod = time.Duration(w.FlushPeriod*1000) * time.Millisecond
-		}
-		if w.UpdateInfoPeriod > 0 {
-			c.UpdateInfoPeriod = getDuration(w.UpdateInfoPeriod)
-		}
-		c.SenderConfig = readQueueablePayloadSenderConfigYaml(w.QueueablePayloadSender)
-	}
-	return c
-}
-
-func readQueueablePayloadSenderConfigYaml(yc queueablePayloadSender) writerconfig.QueuablePayloadSenderConf {
-	c := writerconfig.DefaultQueuablePayloadSenderConf()
-
-	if yc.MaxAge != 0 {
-		c.MaxAge = getDuration(yc.MaxAge)
-	}
-
-	if yc.MaxQueuedBytes != 0 {
-		c.MaxQueuedBytes = yc.MaxQueuedBytes
-	}
-
-	if yc.MaxQueuedPayloads != 0 {
-		c.MaxQueuedPayloads = yc.MaxQueuedPayloads
-	}
-
-	c.ExponentialBackoff = readExponentialBackoffConfigYaml(yc)
-
-	return c
-}
-
-func readExponentialBackoffConfigYaml(yc queueablePayloadSender) backoff.ExponentialConfig {
-	c := backoff.DefaultExponentialConfig()
-
-	if yc.BackoffDuration > 0 {
-		c.MaxDuration = getDuration(yc.BackoffDuration)
-	}
-	if yc.BackoffBase > 0 {
-		c.Base = time.Duration(yc.BackoffBase) * time.Millisecond
-	}
-	if yc.BackoffGrowth > 0 {
-		c.GrowthBase = yc.BackoffGrowth
-	}
-
-	return c
 }
 
 // compileReplaceRules compiles the regular expressions found in the replace rules.
@@ -466,4 +432,47 @@ func splitString(s string, sep rune) ([]string, error) {
 	r.Comma = sep
 
 	return r.Read()
+}
+
+func toFloat64(val interface{}) (float64, error) {
+	switch v := val.(type) {
+	case float64:
+		return v, nil
+	case float32:
+		return float64(v), nil
+	case int:
+		return float64(v), nil
+	case int32:
+		return float64(v), nil
+	case int64:
+		return float64(v), nil
+	case uint:
+		return float64(v), nil
+	case uint32:
+		return float64(v), nil
+	case uint64:
+		return float64(v), nil
+	case string:
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return 0, err
+		}
+		return f, nil
+	default:
+		return 0, fmt.Errorf("%v can not be converted to float64", val)
+	}
+}
+
+// splitTag splits a "k:v" formatted string and returns a Tag.
+func splitTag(tag string) *Tag {
+	parts := strings.SplitN(tag, ":", 2)
+	kv := &Tag{
+		K: strings.TrimSpace(parts[0]),
+	}
+	if len(parts) > 1 {
+		if v := strings.TrimSpace(parts[1]); v != "" {
+			kv.V = v
+		}
+	}
+	return kv
 }

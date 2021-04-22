@@ -1,31 +1,36 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2016-2019 Datadog, Inc.
+// Copyright 2016-present Datadog, Inc.
 
 package providers
 
 import (
 	"errors"
+	"fmt"
 	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"gopkg.in/yaml.v2"
-
+	"github.com/DataDog/datadog-agent/pkg/autodiscovery/configresolver"
 	"github.com/DataDog/datadog-agent/pkg/autodiscovery/integration"
+	"github.com/DataDog/datadog-agent/pkg/autodiscovery/providers/names"
+	"github.com/DataDog/datadog-agent/pkg/config"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
+
+	"gopkg.in/yaml.v2"
 )
 
 type configFormat struct {
-	ADIdentifiers []string    `yaml:"ad_identifiers"`
-	ClusterCheck  bool        `yaml:"cluster_check"`
-	InitConfig    interface{} `yaml:"init_config"`
-	MetricConfig  interface{} `yaml:"jmx_metrics"`
-	LogsConfig    interface{} `yaml:"logs"`
-	Instances     []integration.RawMap
-	DockerImages  []string `yaml:"docker_images"` // Only imported for deprecation warning
+	ADIdentifiers           []string    `yaml:"ad_identifiers"`
+	ClusterCheck            bool        `yaml:"cluster_check"`
+	InitConfig              interface{} `yaml:"init_config"`
+	MetricConfig            interface{} `yaml:"jmx_metrics"`
+	LogsConfig              interface{} `yaml:"logs"`
+	Instances               []integration.RawMap
+	DockerImages            []string `yaml:"docker_images"`             // Only imported for deprecation warning
+	IgnoreAutodiscoveryTags bool     `yaml:"ignore_autodiscovery_tags"` // Use to ignore tags coming from autodiscovery
 }
 
 type configPkg struct {
@@ -134,7 +139,7 @@ func (c *FileConfigProvider) IsUpToDate() (bool, error) {
 
 // String returns a string representation of the FileConfigProvider
 func (c *FileConfigProvider) String() string {
-	return File
+	return names.File
 }
 
 // collectEntry collects a file entry and return it's configuration if valid
@@ -145,6 +150,13 @@ func (c *FileConfigProvider) collectEntry(file os.FileInfo, path string, integra
 	ext := filepath.Ext(fileName)
 	entry := configEntry{}
 	absPath := filepath.Join(path, fileName)
+
+	// skip auto conf files based on the agent configuration
+	if fileName == "auto_conf.yaml" && containsString(config.Datadog.GetStringSlice("ignore_autoconf"), integrationName) {
+		log.Infof("Skipping 'auto_conf.yaml' for integration '%s'", integrationName)
+		entry.err = fmt.Errorf("'auto_conf.yaml' for integration '%s' is skipped", integrationName)
+		return entry
+	}
 
 	// skip config files that are not of type:
 	//  * integration.yaml, integration.yml
@@ -254,9 +266,12 @@ func GetIntegrationConfigFromFile(name, fpath string) (integration.Config, error
 	}
 
 	// Parse configuration
-	err = yaml.Unmarshal(yamlFile, &cf)
-	if err != nil {
-		return config, err
+	// Try UnmarshalStrict first, so we can warn about duplicated keys
+	if strictErr := yaml.UnmarshalStrict(yamlFile, &cf); strictErr != nil {
+		if err := yaml.Unmarshal(yamlFile, &cf); err != nil {
+			return config, err
+		}
+		log.Warnf("reading config file %v: %v\n", fpath, strictErr)
 	}
 
 	// If no valid instances were found & this is neither a metrics file, nor a logs file
@@ -297,10 +312,27 @@ func GetIntegrationConfigFromFile(name, fpath string) (integration.Config, error
 	// Copy cluster_check status
 	config.ClusterCheck = cf.ClusterCheck
 
+	// Copy ignore_autodiscovery_tags parameter
+	config.IgnoreAutodiscoveryTags = cf.IgnoreAutodiscoveryTags
+
 	// DockerImages entry was found: we ignore it if no ADIdentifiers has been found
 	if len(cf.DockerImages) > 0 && len(cf.ADIdentifiers) == 0 {
 		return config, errors.New("the 'docker_images' section is deprecated, please use 'ad_identifiers' instead")
 	}
 
+	// Interpolate env vars. Returns an error a variable wasn't subsituted, ignore it.
+	_ = configresolver.SubstituteTemplateEnvVars(&config)
+
+	config.Source = "file:" + fpath
+
 	return config, err
+}
+
+func containsString(slice []string, str string) bool {
+	for _, s := range slice {
+		if s == str {
+			return true
+		}
+	}
+	return false
 }

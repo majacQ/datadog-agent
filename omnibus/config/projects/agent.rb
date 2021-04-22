@@ -1,8 +1,7 @@
 # Unless explicitly stated otherwise all files in this repository are licensed
 # under the Apache License Version 2.0.
 # This product includes software developed at Datadog (https:#www.datadoghq.com/).
-# Copyright 2016-2019 Datadog, Inc.
-
+# Copyright 2016-present Datadog, Inc.
 require "./lib/ostools.rb"
 
 name 'agent'
@@ -15,10 +14,26 @@ if ohai['platform'] == "windows"
   # dir will be determined by the Windows installer. This path must not contain
   # spaces because Omnibus doesn't quote the Git commands it launches.
   install_dir "C:/opt/datadog-agent/"
+  python_2_embedded "#{install_dir}/embedded2"
+  python_3_embedded "#{install_dir}/embedded3"
   maintainer 'Datadog Inc.' # Windows doesn't want our e-mail address :(
 else
+  if redhat? || suse?
+    maintainer 'Datadog, Inc <package@datadoghq.com>'
+  else
+    maintainer 'Datadog Packages <package@datadoghq.com>'
+  end
+
+  if osx?
+    unless ENV['SKIP_SIGN_MAC'] == 'true'
+      code_signing_identity 'Developer ID Application: Datadog, Inc. (JKFCB4CN7C)'
+    end
+    if ENV['HARDENED_RUNTIME_MAC'] == 'true'
+      entitlements_file "#{files_path}/macos/Entitlements.plist"
+    end
+  end
+
   install_dir '/opt/datadog-agent'
-  maintainer 'Datadog Packages <package@datadoghq.com>'
 end
 
 # build_version is computed by an invoke command/function.
@@ -48,6 +63,12 @@ package :deb do
   license 'Apache License Version 2.0'
   section 'utils'
   priority 'extra'
+  if ENV.has_key?('DEB_SIGNING_PASSPHRASE') and not ENV['DEB_SIGNING_PASSPHRASE'].empty?
+    signing_passphrase "#{ENV['DEB_SIGNING_PASSPHRASE']}"
+    if ENV.has_key?('DEB_GPG_KEY_NAME') and not ENV['DEB_GPG_KEY_NAME'].empty?
+      gpg_key_name "#{ENV['DEB_GPG_KEY_NAME']}"
+    end
+  end
 end
 
 # .rpm specific flags
@@ -77,25 +98,72 @@ compress :dmg do
 end
 
 # Windows .msi specific flags
+package :zip do
+  if windows_arch_i386?
+    skip_packager true
+  else
+    extra_package_dirs [
+      "#{Omnibus::Config.source_dir()}\\etc\\datadog-agent\\extra_package_files",
+      "#{Omnibus::Config.source_dir()}\\cf-root",
+    ]
+
+    additional_sign_files [
+        "#{Omnibus::Config.source_dir()}\\cf-root\\bin\\agent\\security-agent.exe",
+        "#{Omnibus::Config.source_dir()}\\cf-root\\bin\\agent\\process-agent.exe",
+        "#{Omnibus::Config.source_dir()}\\cf-root\\bin\\agent\\trace-agent.exe",
+        "#{Omnibus::Config.source_dir()}\\cf-root\\bin\\agent.exe",
+        "#{Omnibus::Config.source_dir()}\\cf-root\\bin\\libdatadog-agent-three.dll",
+        "#{Omnibus::Config.source_dir()}\\cf-root\\bin\\agent\\install-cmd.exe",
+        "#{Omnibus::Config.source_dir()}\\cf-root\\bin\\agent\\uninstall-cmd.exe"
+      ]
+    if ENV['SIGN_PFX']
+      signing_identity_file "#{ENV['SIGN_PFX']}", password: "#{ENV['SIGN_PFX_PW']}", algorithm: "SHA256"
+    end
+  end
+end
+
 package :msi do
 
   # For a consistent package management, please NEVER change this code
-  upgrade_code '0c50421b-aefb-4f15-a809-7af256d608a5'
+  arch = "x64"
+  if windows_arch_i386?
+    upgrade_code '2497f989-f07e-4e8c-9e05-841ad3d4405f'
+    arch = "x86"
+  else
+    upgrade_code '0c50421b-aefb-4f15-a809-7af256d608a5'
+  end
   wix_candle_extension 'WixUtilExtension'
   wix_light_extension 'WixUtilExtension'
   extra_package_dir "#{Omnibus::Config.source_dir()}\\etc\\datadog-agent\\extra_package_files"
-  additional_sign_files [
+
+  additional_sign_files_list = [
+      "#{Omnibus::Config.source_dir()}\\datadog-agent\\src\\github.com\\DataDog\\datadog-agent\\bin\\agent\\security-agent.exe",
+      "#{Omnibus::Config.source_dir()}\\datadog-agent\\src\\github.com\\DataDog\\datadog-agent\\bin\\agent\\process-agent.exe",
       "#{Omnibus::Config.source_dir()}\\datadog-agent\\src\\github.com\\DataDog\\datadog-agent\\bin\\agent\\trace-agent.exe",
-      "#{Omnibus::Config.source_dir()}\\datadog-agent\\src\\github.com\\DataDog\\datadog-agent\\bin\\agent\\agent.exe"
+      "#{Omnibus::Config.source_dir()}\\datadog-agent\\src\\github.com\\DataDog\\datadog-agent\\bin\\agent\\agent.exe",
+      "#{install_dir}\\bin\\agent\\ddtray.exe"
     ]
-  if ENV['SIGN_WINDOWS']
-    signing_identity "ECCDAE36FDCB654D2CBAB3E8975AA55469F96E4C", machine_store: true, algorithm: "SHA256"
+  #if ENV['SIGN_WINDOWS']
+  #  signing_identity "ECCDAE36FDCB654D2CBAB3E8975AA55469F96E4C", machine_store: true, algorithm: "SHA256"
+  #end
+  if ENV['SIGN_PFX']
+    signing_identity_file "#{ENV['SIGN_PFX']}", password: "#{ENV['SIGN_PFX_PW']}", algorithm: "SHA256"
   end
+  include_sysprobe = "false"
+  if not windows_arch_i386? and ENV['WINDOWS_DDNPM_DRIVER'] and not ENV['WINDOWS_DDNPM_DRIVER'].empty?
+    include_sysprobe = "true"
+    additional_sign_files_list << "#{Omnibus::Config.source_dir()}\\datadog-agent\\src\\github.com\\DataDog\\datadog-agent\\bin\\agent\\system-probe.exe"
+  end
+  additional_sign_files additional_sign_files_list
   parameters({
     'InstallDir' => install_dir,
     'InstallFiles' => "#{Omnibus::Config.source_dir()}/datadog-agent/dd-agent/packaging/datadog-agent/win32/install_files",
     'BinFiles' => "#{Omnibus::Config.source_dir()}/datadog-agent/src/github.com/DataDog/datadog-agent/bin/agent",
     'EtcFiles' => "#{Omnibus::Config.source_dir()}\\etc\\datadog-agent",
+    'IncludePython2' => "#{with_python_runtime? '2'}",
+    'IncludePython3' => "#{with_python_runtime? '3'}",
+    'Platform' => "#{arch}",
+    'IncludeSysprobe' => "#{include_sysprobe}",
   })
 end
 
@@ -106,36 +174,48 @@ end
 # Linux-specific dependencies
 if linux?
   dependency 'procps-ng'
-  dependency 'sysstat'
   dependency 'curl'
 end
 
-dependency 'cacerts'
 # creates required build directories
 dependency 'datadog-agent-prepare'
 
 # Datadog agent
 dependency 'datadog-agent'
 
-# Additional software
-dependency 'pip'
-dependency 'datadog-agent-integrations'
-dependency 'datadog-a7'
-dependency 'datadog-agent-env-check'
-dependency 'jmxfetch'
+# System-probe
+if linux?
+  dependency 'system-probe'
+end
 
-# External agents
-dependency 'datadog-process-agent' # Includes network-tracer
+# Additional software
+if windows?
+  if ENV['WINDOWS_DDNPM_DRIVER'] and not ENV['WINDOWS_DDNPM_DRIVER'].empty?
+    dependency 'datadog-windows-filter-driver'
+  end
+end
+# Bundled cacerts file (is this a good idea?)
+dependency 'cacerts'
 
 if osx?
   dependency 'datadog-agent-mac-app'
 end
 
-# Remove pyc/pyo files from package
-# should be built after all the other python-related software defs
-unless osx?
-  dependency 'py-compiled-cleanup'
+if with_python_runtime? "2"
+  dependency 'pylint2'
+  dependency 'datadog-agent-integrations-py2'
 end
+
+if with_python_runtime? "3"
+  dependency 'datadog-agent-integrations-py3'
+end
+
+if linux?
+  dependency 'datadog-security-agent-policies'
+end
+
+# External agents
+dependency 'jmxfetch'
 
 # version manifest file
 dependency 'version-manifest'
@@ -146,14 +226,15 @@ dependency 'version-manifest'
 # process where we operate outside the omnibus install dir, thus the need of
 # the `extra_package_file` directive.
 # This must be the last dependency in the project.
-
 dependency 'datadog-agent-finalize'
+dependency 'datadog-cf-finalize'
 
 if linux?
   extra_package_file '/etc/init/datadog-agent.conf'
   extra_package_file '/etc/init/datadog-agent-process.conf'
-  extra_package_file '/etc/init/datadog-agent-network.conf'
+  extra_package_file '/etc/init/datadog-agent-sysprobe.conf'
   extra_package_file '/etc/init/datadog-agent-trace.conf'
+  extra_package_file '/etc/init/datadog-agent-security.conf'
   systemd_directory = "/usr/lib/systemd/system"
   if debian?
     systemd_directory = "/lib/systemd/system"
@@ -161,11 +242,19 @@ if linux?
     extra_package_file "/etc/init.d/datadog-agent"
     extra_package_file "/etc/init.d/datadog-agent-process"
     extra_package_file "/etc/init.d/datadog-agent-trace"
+    extra_package_file "/etc/init.d/datadog-agent-security"
+  end
+  if suse?
+    extra_package_file "/etc/init.d/datadog-agent"
+    extra_package_file "/etc/init.d/datadog-agent-process"
+    extra_package_file "/etc/init.d/datadog-agent-trace"
+    extra_package_file "/etc/init.d/datadog-agent-security"
   end
   extra_package_file "#{systemd_directory}/datadog-agent.service"
   extra_package_file "#{systemd_directory}/datadog-agent-process.service"
-  extra_package_file "#{systemd_directory}/datadog-agent-network.service"
+  extra_package_file "#{systemd_directory}/datadog-agent-sysprobe.service"
   extra_package_file "#{systemd_directory}/datadog-agent-trace.service"
+  extra_package_file "#{systemd_directory}/datadog-agent-security.service"
   extra_package_file '/etc/datadog-agent/'
   extra_package_file '/usr/bin/dd-agent'
   extra_package_file '/var/log/datadog/'
@@ -173,3 +262,25 @@ end
 
 exclude '\.git*'
 exclude 'bundler\/git'
+
+if windows?
+  #
+  # For Windows build, files need to be stripped must be specified here.
+  #
+  windows_symbol_stripping_file "#{Omnibus::Config.source_dir()}\\cf-root\\bin\\agent\\security-agent.exe"
+  windows_symbol_stripping_file "#{Omnibus::Config.source_dir()}\\cf-root\\bin\\agent\\process-agent.exe"
+  windows_symbol_stripping_file "#{Omnibus::Config.source_dir()}\\cf-root\\bin\\agent\\trace-agent.exe"
+  windows_symbol_stripping_file "#{Omnibus::Config.source_dir()}\\cf-root\\bin\\agent.exe"
+  windows_symbol_stripping_file "#{Omnibus::Config.source_dir()}\\datadog-agent\\src\\github.com\\DataDog\\datadog-agent\\bin\\agent\\security-agent.exe"
+  windows_symbol_stripping_file "#{Omnibus::Config.source_dir()}\\datadog-agent\\src\\github.com\\DataDog\\datadog-agent\\bin\\agent\\process-agent.exe"
+  windows_symbol_stripping_file "#{Omnibus::Config.source_dir()}\\datadog-agent\\src\\github.com\\DataDog\\datadog-agent\\bin\\agent\\trace-agent.exe"
+  windows_symbol_stripping_file "#{Omnibus::Config.source_dir()}\\datadog-agent\\src\\github.com\\DataDog\\datadog-agent\\bin\\agent\\agent.exe"
+end
+
+if linux? or windows?
+  # the stripper will drop the symbols in a `.debug` folder in the installdir
+  # we want to make sure that directory is not in the main build, while present
+  # in the debug package.
+  strip_build true
+  debug_path ".debug"  # the strip symbols will be in here
+end

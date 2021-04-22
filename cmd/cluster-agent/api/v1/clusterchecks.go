@@ -1,7 +1,7 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2016-2019 Datadog, Inc.
+// Copyright 2016-present Datadog, Inc.
 
 // +build clusterchecks
 
@@ -9,6 +9,8 @@ package v1
 
 import (
 	"encoding/json"
+	"fmt"
+	"net"
 	"net/http"
 
 	"github.com/gorilla/mux"
@@ -16,12 +18,16 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/clusteragent"
 	"github.com/DataDog/datadog-agent/pkg/clusteragent/clusterchecks"
 	cctypes "github.com/DataDog/datadog-agent/pkg/clusteragent/clusterchecks/types"
+	"github.com/DataDog/datadog-agent/pkg/config"
+	dcautil "github.com/DataDog/datadog-agent/pkg/util/clusteragent"
+	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
 // Install registers v1 API endpoints
 func installClusterCheckEndpoints(r *mux.Router, sc clusteragent.ServerContext) {
-	r.HandleFunc("/clusterchecks/status/{nodeName}", postCheckStatus(sc)).Methods("POST")
-	r.HandleFunc("/clusterchecks/configs/{nodeName}", getCheckConfigs(sc)).Methods("GET")
+	r.HandleFunc("/clusterchecks/status/{identifier}", postCheckStatus(sc)).Methods("POST")
+	r.HandleFunc("/clusterchecks/configs/{identifier}", getCheckConfigs(sc)).Methods("GET")
+	r.HandleFunc("/clusterchecks/rebalance", postRebalanceChecks(sc)).Methods("POST")
 	r.HandleFunc("/clusterchecks", getState(sc)).Methods("GET")
 }
 
@@ -37,7 +43,7 @@ func postCheckStatus(sc clusteragent.ServerContext) func(w http.ResponseWriter, 
 		}
 
 		vars := mux.Vars(r)
-		nodeName := vars["nodeName"]
+		identifier := vars["identifier"]
 
 		decoder := json.NewDecoder(r.Body)
 		var status cctypes.NodeStatus
@@ -48,7 +54,14 @@ func postCheckStatus(sc clusteragent.ServerContext) func(w http.ResponseWriter, 
 			return
 		}
 
-		response, err := sc.ClusterCheckHandler.PostStatus(nodeName, status)
+		clientIP, err := validateClientIP(r.Header.Get(dcautil.RealIPHeader))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			incrementRequestMetric("postCheckStatus", http.StatusInternalServerError)
+			return
+		}
+
+		response, err := sc.ClusterCheckHandler.PostStatus(identifier, clientIP, status)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			incrementRequestMetric("postCheckStatus", http.StatusInternalServerError)
@@ -71,8 +84,8 @@ func getCheckConfigs(sc clusteragent.ServerContext) func(w http.ResponseWriter, 
 		}
 
 		vars := mux.Vars(r)
-		nodeName := vars["nodeName"]
-		response, err := sc.ClusterCheckHandler.GetConfigs(nodeName)
+		identifier := vars["identifier"]
+		response, err := sc.ClusterCheckHandler.GetConfigs(identifier)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			incrementRequestMetric("getCheckConfigs", http.StatusInternalServerError)
@@ -80,6 +93,28 @@ func getCheckConfigs(sc clusteragent.ServerContext) func(w http.ResponseWriter, 
 		}
 
 		writeJSONResponse(w, response, "getCheckConfigs")
+	}
+}
+
+// postRebalanceChecks requests that the cluster checks be rebalanced
+func postRebalanceChecks(sc clusteragent.ServerContext) func(w http.ResponseWriter, r *http.Request) {
+	if sc.ClusterCheckHandler == nil {
+		return clusterChecksDisabledHandler
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !shouldHandle(w, r, sc.ClusterCheckHandler, "postRebalanceChecks") {
+			return
+		}
+
+		response, err := sc.ClusterCheckHandler.RebalanceClusterChecks()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			incrementRequestMetric("postRebalanceChecks", http.StatusInternalServerError)
+			return
+		}
+
+		writeJSONResponse(w, response, "postRebalanceChecks")
 	}
 }
 
@@ -146,6 +181,22 @@ func shouldHandle(w http.ResponseWriter, r *http.Request, h *clusterchecks.Handl
 
 // clusterChecksDisabledHandler returns a 404 response when cluster-checks are disabled
 func clusterChecksDisabledHandler(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(http.StatusNotFound)
+	w.WriteHeader(http.StatusPreconditionFailed)
 	w.Write([]byte("Cluster-checks are not enabled"))
+}
+
+// validateClientIP validates the http client IP retrieved from the request's header.
+// Empty IPs are considered valid for backward compatibility with old clc runner versions
+// that don't set the realIPHeader header field.
+func validateClientIP(addr string) (string, error) {
+	if addr != "" && net.ParseIP(addr) == nil {
+		log.Debugf("Error while parsing CLC runner address %s", addr)
+		return "", fmt.Errorf("cannot parse CLC runner address: %s", addr)
+	}
+
+	if addr == "" && config.Datadog.GetBool("cluster_checks.advanced_dispatching_enabled") {
+		log.Warn("Cluster check dispatching error: cannot get runner IP from http headers. advanced_dispatching_enabled requires agent 6.17 or above.")
+	}
+
+	return addr, nil
 }

@@ -9,3 +9,7 @@ What inspired you to submit this pull request?
 ### Additional Notes
 
 Anything else we should know when reviewing?
+
+### Describe your test plan
+
+Write there any instructions and details that should be tested during the QA.

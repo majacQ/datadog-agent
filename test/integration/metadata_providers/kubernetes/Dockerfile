@@ -1,5 +1,5 @@
 # Development Dockerfile
-FROM golang:1.8.3
+FROM golang:1.15.11
 
 MAINTAINER Datadog <package@datadoghq.com>
 

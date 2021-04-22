@@ -1,29 +1,26 @@
 """
 Benchmarking tasks
 """
-from __future__ import print_function
+
+
 import os
 import sys
 
-import invoke
 from invoke import task
 
 from .build_tags import get_default_build_tags
-from .utils import bin_name
-from .utils import get_git_branch_name
-from .utils import REPO_PATH
-
+from .utils import REPO_PATH, bin_name, get_git_branch_name
 
 # constants
 BENCHMARKS_BIN_PATH = os.path.join(".", "bin", "benchmarks")
 
 
 @task
-def build_aggregator(ctx, rebuild=False):
+def build_aggregator(ctx, rebuild=False, arch="x64"):
     """
     Build the Aggregator benchmarks.
     """
-    build_tags = get_default_build_tags()  # pass all the build flags
+    build_tags = get_default_build_tags(build="test", arch=arch)  # pass all the build flags
 
     ldflags = ""
     gcflags = ""
@@ -35,28 +32,30 @@ def build_aggregator(ctx, rebuild=False):
             # if you want to be able to use the delve debugger.
             ldflags += " -linkmode internal"
 
-    cmd = "go build {build_type} -tags \"{build_tags}\" -o {bin_name} "
+    cmd = "go build -mod={go_mod} {build_type} -tags \"{build_tags}\" -o {bin_name} "
     cmd += "{ldflags} {gcflags} {REPO_PATH}/test/benchmarks/aggregator"
     args = {
+        "go_mod": "mod",
         "build_type": "-a" if rebuild else "",
         "build_tags": " ".join(build_tags),
         "bin_name": os.path.join(BENCHMARKS_BIN_PATH, bin_name("aggregator")),
         "ldflags": ldflags,
         "gcflags": gcflags,
-        "REPO_PATH": REPO_PATH
+        "REPO_PATH": REPO_PATH,
     }
     ctx.run(cmd.format(**args))
 
 
 @task
-def build_dogstatsd(ctx):
+def build_dogstatsd(ctx, arch="x64"):
     """
     Build Dogstatsd benchmarks.
     """
-    build_tags = get_default_build_tags()  # pass all the build flags
+    build_tags = get_default_build_tags(build="test", arch=arch)  # pass all the build flags
 
-    cmd = "go build -tags \"{build_tags}\" -o {bin_name} {REPO_PATH}/test/benchmarks/dogstatsd"
+    cmd = "go build -mod={go_mod} -tags \"{build_tags}\" -o {bin_name} {REPO_PATH}/test/benchmarks/dogstatsd"
     args = {
+        "go_mod": "mod",
         "build_tags": " ".join(build_tags),
         "bin_name": os.path.join(BENCHMARKS_BIN_PATH, bin_name("dogstatsd")),
         "REPO_PATH": REPO_PATH,
@@ -64,8 +63,25 @@ def build_dogstatsd(ctx):
     ctx.run(cmd.format(**args))
 
 
+@task
+def build_kubernetes_state(ctx, arch="x64"):
+    """
+    Build Kubernetes_State benchmarks.
+    """
+    build_tags = get_default_build_tags(build="test", arch=arch)  # pass all the build flags
+
+    cmd = "go build -mod={go_mod} -tags \"{build_tags}\" -o {bin_name} {REPO_PATH}/test/benchmarks/kubernetes_state"
+    args = {
+        "go_mod": "mod",
+        "build_tags": " ".join(build_tags),
+        "bin_name": os.path.join(BENCHMARKS_BIN_PATH, bin_name("kubernetes_state")),
+        "REPO_PATH": REPO_PATH,
+    }
+    ctx.run(cmd.format(**args))
+
+
 @task(pre=[build_dogstatsd])
-def dogstastd(ctx):
+def dogstatsd(ctx):
     """
     Run Dogstatsd Benchmarks.
     """
@@ -78,6 +94,12 @@ def dogstastd(ctx):
         options += " -api-key {}".format(key)
 
     ctx.run("{} -pps=5000 -dur 45 -ser 5 -brk -inc 1000 {}".format(bin_path, options))
+
+
+# Temporarily keep compatibility after typo fix
+@task(pre=[build_dogstatsd])
+def dogstastd(ctx):
+    dogstatsd(ctx)
 
 
 @task(pre=[build_aggregator])
@@ -94,4 +116,18 @@ def aggregator(ctx):
         options += " -api-key {}".format(key)
 
     ctx.run("{} -points 2,10,100,500,1000 -series 10,100,1000 -log-level info -json {}".format(bin_path, options))
-    ctx.run("{} -points 2,10,100,500,1000 -series 10,100,1000 -log-level info -json -memory -duration 10 {}".format(bin_path, options))
+    ctx.run(
+        "{} -points 2,10,100,500,1000 -series 10,100,1000 -log-level info -json -memory -duration 10 {}".format(
+            bin_path, options
+        )
+    )
+
+
+@task(pre=[build_kubernetes_state])
+def kubernetes_state(ctx):
+    """
+    Run Kubernetes_State Benchmarks.
+    """
+    bin_path = os.path.join(BENCHMARKS_BIN_PATH, bin_name("kubernetes_state"))
+
+    ctx.run("{}".format(bin_path))

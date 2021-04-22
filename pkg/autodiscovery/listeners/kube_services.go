@@ -1,7 +1,7 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2016-2019 Datadog, Inc.
+// Copyright 2016-present Datadog, Inc.
 
 // +build clusterchecks
 // +build kubeapiserver
@@ -13,13 +13,15 @@ import (
 	"sort"
 	"sync"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/types"
+	k8stypes "k8s.io/apimachinery/pkg/types"
 	infov1 "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/tools/cache"
 
+	"github.com/DataDog/datadog-agent/pkg/autodiscovery/common/types"
 	"github.com/DataDog/datadog-agent/pkg/autodiscovery/integration"
+	"github.com/DataDog/datadog-agent/pkg/util/containers"
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes/apiserver"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
@@ -30,11 +32,12 @@ const (
 
 // KubeServiceListener listens to kubernetes service creation
 type KubeServiceListener struct {
-	informer   infov1.ServiceInformer
-	services   map[types.UID]Service
-	newService chan<- Service
-	delService chan<- Service
-	m          sync.RWMutex
+	informer      infov1.ServiceInformer
+	services      map[k8stypes.UID]Service
+	promInclAnnot types.PrometheusAnnotations
+	newService    chan<- Service
+	delService    chan<- Service
+	m             sync.RWMutex
 }
 
 // KubeServiceService represents a Kubernetes Service
@@ -46,22 +49,29 @@ type KubeServiceService struct {
 	creationTime integration.CreationTime
 }
 
+// Make sure KubeServiceService implements the Service interface
+var _ Service = &KubeServiceService{}
+
 func init() {
 	Register("kube_services", NewKubeServiceListener)
 }
 
 func NewKubeServiceListener() (ServiceListener, error) {
+	// Using GetAPIClient (no wait) as Client should already be initialized by Cluster Agent main entrypoint before
 	ac, err := apiserver.GetAPIClient()
 	if err != nil {
 		return nil, fmt.Errorf("cannot connect to apiserver: %s", err)
 	}
+
 	servicesInformer := ac.InformerFactory.Core().V1().Services()
 	if servicesInformer == nil {
 		return nil, fmt.Errorf("cannot get service informer: %s", err)
 	}
+
 	return &KubeServiceListener{
-		services: make(map[types.UID]Service),
-		informer: servicesInformer,
+		services:      make(map[k8stypes.UID]Service),
+		informer:      servicesInformer,
+		promInclAnnot: getPrometheusIncludeAnnotations(),
 	}, nil
 }
 
@@ -123,7 +133,7 @@ func (l *KubeServiceListener) updated(old, obj interface{}) {
 		l.createService(castedObj, false)
 		return
 	}
-	if servicesDiffer(castedObj, castedOld) {
+	if servicesDiffer(castedObj, castedOld) || l.promInclAnnot.AnnotationsDiffer(castedObj.GetAnnotations(), castedOld.GetAnnotations()) {
 		l.removeService(castedObj)
 		l.createService(castedObj, false)
 	}
@@ -137,8 +147,12 @@ func servicesDiffer(first, second *v1.Service) bool {
 	if first.ResourceVersion == second.ResourceVersion {
 		return false
 	}
-	// AD annotations
-	if isServiceAnnotated(first) != isServiceAnnotated(second) {
+	// AD annotations - check templates
+	if isServiceAnnotated(first, kubeServiceAnnotationFormat) != isServiceAnnotated(second, kubeServiceAnnotationFormat) {
+		return true
+	}
+	// AD labels - standard tags
+	if standardTagsDigest(first.GetLabels()) != standardTagsDigest(second.GetLabels()) {
 		return true
 	}
 	// Cluster IP
@@ -165,8 +179,9 @@ func (l *KubeServiceListener) createService(ksvc *v1.Service, firstRun bool) {
 	if ksvc == nil {
 		return
 	}
-	if !isServiceAnnotated(ksvc) {
-		// Ignore services with no AD annotation
+
+	if !isServiceAnnotated(ksvc, kubeServiceAnnotationFormat) && !l.promInclAnnot.IsMatchingAnnotations(ksvc.GetAnnotations()) {
+		// Ignore services with no AD or Prometheus AD include annotation
 		return
 	}
 
@@ -188,11 +203,14 @@ func processService(ksvc *v1.Service, firstRun bool) *KubeServiceService {
 		svc.creationTime = integration.Before
 	}
 
-	// Tags, static for now
+	// Service tags
 	svc.tags = []string{
 		fmt.Sprintf("kube_service:%s", ksvc.Name),
 		fmt.Sprintf("kube_namespace:%s", ksvc.Namespace),
 	}
+
+	// Standard tags from the service's labels
+	svc.tags = append(svc.tags, getStandardTags(ksvc.GetLabels())...)
 
 	// Hosts, only use internal ClusterIP for now
 	svc.hosts = map[string]string{"cluster": ksvc.Spec.ClusterIP}
@@ -238,6 +256,11 @@ func (s *KubeServiceService) GetEntity() string {
 	return s.entity
 }
 
+// GetEntity returns the unique entity name linked to that service
+func (s *KubeServiceService) GetTaggerEntity() string {
+	return s.entity
+}
+
 // GetADIdentifiers returns the service AD identifiers
 func (s *KubeServiceService) GetADIdentifiers() ([]string, error) {
 	// Only the entity for now, to match on annotation
@@ -260,8 +283,8 @@ func (s *KubeServiceService) GetPorts() ([]ContainerPort, error) {
 }
 
 // GetTags retrieves tags
-func (s *KubeServiceService) GetTags() ([]string, error) {
-	return s.tags, nil
+func (s *KubeServiceService) GetTags() ([]string, string, error) {
+	return s.tags, "", nil
 }
 
 // GetHostname returns nil and an error because port is not supported in Kubelet
@@ -274,7 +297,24 @@ func (s *KubeServiceService) GetCreationTime() integration.CreationTime {
 	return s.creationTime
 }
 
-func isServiceAnnotated(ksvc *v1.Service) bool {
-	_, found := ksvc.Annotations[kubeServiceAnnotationFormat]
-	return found
+// IsReady returns if the service is ready
+func (s *KubeServiceService) IsReady() bool {
+	return true
+}
+
+// GetCheckNames returns slice of check names defined in kubernetes annotations or docker labels
+// KubeServiceService doesn't implement this method
+func (s *KubeServiceService) GetCheckNames() []string {
+	return nil
+}
+
+// HasFilter always return false
+// KubeServiceService doesn't implement this method
+func (s *KubeServiceService) HasFilter(filter containers.FilterType) bool {
+	return false
+}
+
+// GetExtraConfig isn't supported
+func (s *KubeServiceService) GetExtraConfig(key []byte) ([]byte, error) {
+	return []byte{}, ErrNotSupported
 }

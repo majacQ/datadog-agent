@@ -1,11 +1,13 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2016-2019 Datadog, Inc.
+// Copyright 2016-present Datadog, Inc.
 
 package types
 
-import "github.com/DataDog/datadog-agent/pkg/autodiscovery/integration"
+import (
+	"github.com/DataDog/datadog-agent/pkg/autodiscovery/integration"
+)
 
 // NodeStatus holds the status report from the node-agent
 type NodeStatus struct {
@@ -15,6 +17,18 @@ type NodeStatus struct {
 // StatusResponse holds the DCA response for a status report
 type StatusResponse struct {
 	IsUpToDate bool `json:"isuptodate"`
+}
+
+// RebalanceResponse holds the DCA response for a rebalancing request
+type RebalanceResponse struct {
+	CheckID     string `json:"check_id"`
+	CheckWeight int    `json:"check_weight"`
+
+	SourceNodeName string `json:"source_node_name"`
+	SourceDiff     int    `json:"source_diff"`
+
+	DestNodeName string `json:"dest_node_name"`
+	DestDiff     int    `json:"dest_diff"`
 }
 
 // ConfigResponse holds the DCA response for a config query
@@ -50,4 +64,19 @@ type Stats struct {
 	ActiveConfigs   int
 	DanglingConfigs int
 	TotalConfigs    int
+}
+
+// LeaderIPCallback describes the leader-election method we
+// need and allows to inject a custom one for tests
+type LeaderIPCallback func() (string, error)
+
+// CLCRunnersStats is used to unmarshall the CLC Runners stats payload
+type CLCRunnersStats map[string]CLCRunnerStats
+
+// CLCRunnerStats is used to unmarshall the stats of each CLC Runner
+type CLCRunnerStats struct {
+	AverageExecutionTime int  `json:"AverageExecutionTime"`
+	MetricSamples        int  `json:"MetricSamples"`
+	IsClusterCheck       bool `json:"IsClusterCheck"`
+	LastExecFailed       bool `json:"LastExecFailed"`
 }

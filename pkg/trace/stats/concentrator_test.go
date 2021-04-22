@@ -1,3 +1,8 @@
+// Unless explicitly stated otherwise all files in this repository are licensed
+// under the Apache License Version 2.0.
+// This product includes software developed at Datadog (https://www.datadoghq.com/).
+// Copyright 2016-present Datadog, Inc.
+
 package stats
 
 import (
@@ -6,17 +11,29 @@ import (
 	"testing"
 	"time"
 
+	"github.com/DataDog/datadog-agent/pkg/trace/config"
+	"github.com/DataDog/datadog-agent/pkg/trace/info"
 	"github.com/DataDog/datadog-agent/pkg/trace/pb"
 	"github.com/DataDog/datadog-agent/pkg/trace/traceutil"
 
+	"github.com/DataDog/sketches-go/ddsketch"
+	"github.com/DataDog/sketches-go/ddsketch/pb/sketchpb"
+	"github.com/golang/protobuf/proto"
 	"github.com/stretchr/testify/assert"
 )
 
-var testBucketInterval = time.Duration(2 * time.Second).Nanoseconds()
+var (
+	testBucketInterval = (2 * time.Second).Nanoseconds()
+)
 
-func NewTestConcentrator() *Concentrator {
-	statsChan := make(chan []Bucket)
-	return NewConcentrator([]string{}, time.Second.Nanoseconds(), statsChan)
+func NewTestConcentrator(now time.Time) *Concentrator {
+	statsChan := make(chan pb.StatsPayload)
+	cfg := config.AgentConfig{
+		BucketInterval: time.Duration(testBucketInterval),
+		DefaultEnv:     "env",
+		Hostname:       "hostname",
+	}
+	return NewConcentrator(&cfg, statsChan, now)
 }
 
 // getTsInBucket gives a timestamp in ns which is `offset` buckets late
@@ -43,13 +60,28 @@ func testSpan(spanID uint64, parentID uint64, duration, offset int64, service, r
 	}
 }
 
+// assertCountsEqual is a test utility function to assert expected == actual for count aggregations.
+func assertCountsEqual(t *testing.T, expected []pb.ClientGroupedStats, actual []pb.ClientGroupedStats) {
+	expectedM := make(map[string]pb.ClientGroupedStats)
+	actualM := make(map[string]pb.ClientGroupedStats)
+	for _, e := range expected {
+		e.ErrorSummary = nil
+		e.OkSummary = nil
+		expectedM[e.Service+e.Resource] = e
+	}
+	for _, a := range actual {
+		a.ErrorSummary = nil
+		a.OkSummary = nil
+		actualM[a.Service+a.Resource] = a
+	}
+	assert.Equal(t, expectedM, actualM)
+}
+
 // TestConcentratorOldestTs tests that the Agent doesn't report time buckets from a
 // time before its start
 func TestConcentratorOldestTs(t *testing.T) {
 	assert := assert.New(t)
-	statsChan := make(chan []Bucket)
-
-	now := time.Now().UnixNano()
+	now := time.Now()
 
 	// Build that simply have spans spread over time windows.
 	trace := pb.Trace{
@@ -71,13 +103,13 @@ func TestConcentratorOldestTs(t *testing.T) {
 
 	t.Run("cold", func(t *testing.T) {
 		// Running cold, all spans in the past should end up in the current time bucket.
-		flushTime := now
-		c := NewConcentrator([]string{}, testBucketInterval, statsChan)
-		c.Add(testTrace)
+		flushTime := now.UnixNano()
+		c := NewTestConcentrator(now)
+		c.addNow(testTrace)
 
 		for i := 0; i < c.bufferLen; i++ {
 			stats := c.flushNow(flushTime)
-			if !assert.Equal(0, len(stats), "We should get exactly 0 Bucket") {
+			if !assert.Equal(0, len(stats.Stats), "We should get exactly 0 Bucket") {
 				t.FailNow()
 			}
 			flushTime += testBucketInterval
@@ -85,77 +117,92 @@ func TestConcentratorOldestTs(t *testing.T) {
 
 		stats := c.flushNow(flushTime)
 
-		if !assert.Equal(1, len(stats), "We should get exactly 1 Bucket") {
+		if !assert.Equal(1, len(stats.Stats), "We should get exactly 1 Bucket") {
 			t.FailNow()
 		}
 
-		// First oldest bucket aggregates old past time buckets, it should have it all.
-		for key, count := range stats[0].Counts {
-			if key == "query|duration|env:none,resource:resource1,service:A1" {
-				assert.Equal(151, int(count.Value), "Wrong value for duration")
-			}
-			if key == "query|hits|env:none,resource:resource1,service:A1" {
-				assert.Equal(6, int(count.Value), "Wrong value for hits")
-			}
+		// First oldest bucket aggregates old past time buckets, so each count
+		// should be an aggregated total across the spans.
+		expected := []pb.ClientGroupedStats{
+			{
+				Service:      "A1",
+				Resource:     "resource1",
+				Type:         "db",
+				Name:         "query",
+				Duration:     151,
+				Hits:         6,
+				TopLevelHits: 6,
+				Errors:       0,
+			},
 		}
+		assertCountsEqual(t, expected, stats.Stats[0].Stats[0].Stats)
 	})
 
 	t.Run("hot", func(t *testing.T) {
-		flushTime := now
-		c := NewConcentrator([]string{}, testBucketInterval, statsChan)
-		c.oldestTs = alignTs(now, c.bsize) - int64(c.bufferLen-1)*c.bsize
-		c.Add(testTrace)
+		flushTime := now.UnixNano()
+		c := NewTestConcentrator(now)
+		c.oldestTs = alignTs(flushTime, c.bsize) - int64(c.bufferLen-1)*c.bsize
+		c.addNow(testTrace)
 
 		for i := 0; i < c.bufferLen-1; i++ {
 			stats := c.flushNow(flushTime)
-			if !assert.Equal(0, len(stats), "We should get exactly 0 Bucket") {
+			if !assert.Equal(0, len(stats.Stats), "We should get exactly 0 Bucket") {
 				t.FailNow()
 			}
 			flushTime += testBucketInterval
 		}
 
 		stats := c.flushNow(flushTime)
-		if !assert.Equal(1, len(stats), "We should get exactly 1 Bucket") {
+		if !assert.Equal(1, len(stats.Stats), "We should get exactly 1 Bucket") {
 			t.FailNow()
 		}
 		flushTime += testBucketInterval
 
-		// First oldest bucket aggregates, it should have it all except the last span.
-		for key, count := range stats[0].Counts {
-			if key == "query|duration|env:none,resource:resource1,service:A1" {
-				assert.Equal(150, int(count.Value), "Wrong value for duration")
-			}
-			if key == "query|hits|env:none,resource:resource1,service:A1" {
-				assert.Equal(5, int(count.Value), "Wrong value for hits")
-			}
+		// First oldest bucket aggregates, it should have it all except the
+		// last four spans that have offset of 0.
+		expected := []pb.ClientGroupedStats{
+			{
+				Service:      "A1",
+				Resource:     "resource1",
+				Type:         "db",
+				Name:         "query",
+				Duration:     150,
+				Hits:         5,
+				TopLevelHits: 5,
+				Errors:       0,
+			},
 		}
+		assertCountsEqual(t, expected, stats.Stats[0].Stats[0].Stats)
 
 		stats = c.flushNow(flushTime)
-		if !assert.Equal(1, len(stats), "We should get exactly 1 Bucket") {
+		if !assert.Equal(1, len(stats.Stats), "We should get exactly 1 Bucket") {
 			t.FailNow()
 		}
 
-		// Stats of the last span.
-		for key, count := range stats[0].Counts {
-			if key == "query|duration|env:none,resource:resource1,service:A1" {
-				assert.Equal(1, int(count.Value), "Wrong value for duration")
-			}
-			if key == "query|hits|env:none,resource:resource1,service:A1" {
-				assert.Equal(1, int(count.Value), "Wrong value for hits")
-			}
+		// Stats of the last four spans.
+		expected = []pb.ClientGroupedStats{
+			{
+				Service:      "A1",
+				Resource:     "resource1",
+				Type:         "db",
+				Name:         "query",
+				Duration:     1,
+				Hits:         1,
+				TopLevelHits: 1,
+				Errors:       0,
+			},
 		}
+		assertCountsEqual(t, expected, stats.Stats[0].Stats[0].Stats)
 	})
 }
 
-//TestConcentratorStatsTotals tests that the total stats are correct, independently of the
+// TestConcentratorStatsTotals tests that the total stats are correct, independently of the
 // time bucket they end up.
 func TestConcentratorStatsTotals(t *testing.T) {
 	assert := assert.New(t)
-	statsChan := make(chan []Bucket)
-	c := NewConcentrator([]string{}, testBucketInterval, statsChan)
-
-	now := time.Now().UnixNano()
-	alignedNow := alignTs(now, c.bsize)
+	now := time.Now()
+	c := NewTestConcentrator(now)
+	alignedNow := alignTs(now.UnixNano(), c.bsize)
 
 	// update oldestTs as it running for quite some time, to avoid the fact that at startup
 	// it only allows recent stats.
@@ -174,46 +221,51 @@ func TestConcentratorStatsTotals(t *testing.T) {
 	traceutil.ComputeTopLevel(trace)
 	wt := NewWeightedTrace(trace, traceutil.GetRoot(trace))
 
-	testTrace := &Input{
-		Env:   "none",
-		Trace: wt,
-	}
-	c.Add(testTrace)
+	t.Run("ok", func(t *testing.T) {
+		testTrace := &Input{
+			Env:   "none",
+			Trace: wt,
+		}
+		c.addNow(testTrace)
 
-	var hits float64
-	var duration float64
+		var duration uint64
+		var hits uint64
+		var errors uint64
+		var topLevelHits uint64
 
-	flushTime := now
-	for i := 0; i <= c.bufferLen; i++ {
-		stats := c.flushNow(flushTime)
+		flushTime := now.UnixNano()
+		for i := 0; i <= c.bufferLen; i++ {
+			stats := c.flushNow(flushTime)
 
-		if len(stats) == 0 {
-			continue
+			if len(stats.Stats) == 0 {
+				continue
+			}
+
+			for _, b := range stats.Stats[0].Stats[0].Stats {
+				duration += b.Duration
+				hits += b.Hits
+				errors += b.Errors
+				topLevelHits += b.TopLevelHits
+			}
+			flushTime += c.bsize
 		}
 
-		for key, count := range stats[0].Counts {
-			if key == "query|duration|env:none,resource:resource1,service:A1" {
-				duration += count.Value
-			}
-			if key == "query|hits|env:none,resource:resource1,service:A1" {
-				hits += count.Value
-			}
-		}
-		flushTime += c.bsize
-	}
-
-	assert.Equal(hits, float64(len(trace)), "Wrong value for total hits %d", hits)
-	assert.Equal(duration, float64(50+40+30+20+10+1), "Wrong value for total duration %d", duration)
+		assert.Equal(duration, uint64(50+40+30+20+10+1), "Wrong value for total duration %d", duration)
+		assert.Equal(hits, uint64(len(trace)), "Wrong value for total hits %d", hits)
+		assert.Equal(topLevelHits, uint64(len(trace)), "Wrong value for total top level hits %d", topLevelHits)
+		assert.Equal(errors, uint64(0), "Wrong value for total errors %d", errors)
+	})
 }
 
 // TestConcentratorStatsCounts tests exhaustively each stats bucket, over multiple time buckets.
 func TestConcentratorStatsCounts(t *testing.T) {
+	defer func(old string) { info.Version = old }(info.Version)
+	info.Version = "0.99.0"
 	assert := assert.New(t)
-	statsChan := make(chan []Bucket)
-	c := NewConcentrator([]string{}, testBucketInterval, statsChan)
+	now := time.Now()
+	c := NewTestConcentrator(now)
 
-	now := time.Now().UnixNano()
-	alignedNow := alignTs(now, c.bsize)
+	alignedNow := alignTs(now.UnixNano(), c.bsize)
 
 	// update oldestTs as it running for quite some time, to avoid the fact that at startup
 	// it only allows recent stats.
@@ -240,41 +292,107 @@ func TestConcentratorStatsCounts(t *testing.T) {
 		testSpan(6, 0, 24, 0, "A1", "resource2", 0),
 	}
 
-	expectedCountValByKeyByTime := make(map[int64]map[string]int64)
-	expectedCountValByKeyByTime[alignedNow-2*testBucketInterval] = map[string]int64{
-		"query|duration|env:none,resource:resource1,service:A1":   369,
-		"query|duration|env:none,resource:resource2,service:A2":   300000000040,
-		"query|duration|env:none,resource:resourcefoo,service:A2": 30,
-		"query|errors|env:none,resource:resource1,service:A1":     1,
-		"query|errors|env:none,resource:resource2,service:A2":     2,
-		"query|errors|env:none,resource:resourcefoo,service:A2":   0,
-		"query|hits|env:none,resource:resource1,service:A1":       4,
-		"query|hits|env:none,resource:resource2,service:A2":       2,
-		"query|hits|env:none,resource:resourcefoo,service:A2":     1,
+	expectedCountValByKeyByTime := make(map[int64][]pb.ClientGroupedStats)
+	// 2-bucket old flush
+	expectedCountValByKeyByTime[alignedNow-2*testBucketInterval] = []pb.ClientGroupedStats{
+		{
+			Service:      "A1",
+			Resource:     "resource1",
+			Type:         "db",
+			Name:         "query",
+			Duration:     369,
+			Hits:         4,
+			TopLevelHits: 4,
+			Errors:       1,
+		},
+		{
+			Service:      "A2",
+			Resource:     "resource2",
+			Type:         "db",
+			Name:         "query",
+			Duration:     300000000040,
+			Hits:         2,
+			TopLevelHits: 2,
+			Errors:       2,
+		},
+		{
+			Service:      "A2",
+			Resource:     "resourcefoo",
+			Type:         "db",
+			Name:         "query",
+			Duration:     30,
+			Hits:         1,
+			TopLevelHits: 1,
+			Errors:       0,
+		},
 	}
-	expectedCountValByKeyByTime[alignedNow-1*testBucketInterval] = map[string]int64{
-		"query|duration|env:none,resource:resource1,service:A1":   12,
-		"query|duration|env:none,resource:resource2,service:A1":   24,
-		"query|duration|env:none,resource:resource1,service:A2":   40,
-		"query|duration|env:none,resource:resource2,service:A2":   30,
-		"query|duration|env:none,resource:resourcefoo,service:A2": 3600000000000,
-		"query|errors|env:none,resource:resource1,service:A1":     1,
-		"query|errors|env:none,resource:resource2,service:A1":     0,
-		"query|errors|env:none,resource:resource1,service:A2":     1,
-		"query|errors|env:none,resource:resource2,service:A2":     1,
-		"query|errors|env:none,resource:resourcefoo,service:A2":   0,
-		"query|hits|env:none,resource:resource1,service:A1":       1,
-		"query|hits|env:none,resource:resource2,service:A1":       1,
-		"query|hits|env:none,resource:resource1,service:A2":       1,
-		"query|hits|env:none,resource:resource2,service:A2":       1,
-		"query|hits|env:none,resource:resourcefoo,service:A2":     1,
+	// 1-bucket old flush
+	expectedCountValByKeyByTime[alignedNow-testBucketInterval] = []pb.ClientGroupedStats{
+		{
+			Service:      "A1",
+			Resource:     "resource1",
+			Type:         "db",
+			Name:         "query",
+			Duration:     12,
+			Hits:         1,
+			TopLevelHits: 1,
+			Errors:       1,
+		},
+		{
+			Service:      "A1",
+			Resource:     "resource2",
+			Type:         "db",
+			Name:         "query",
+			Duration:     24,
+			Hits:         1,
+			TopLevelHits: 1,
+			Errors:       0,
+		},
+		{
+			Service:      "A2",
+			Resource:     "resource1",
+			Type:         "db",
+			Name:         "query",
+			Duration:     40,
+			Hits:         1,
+			TopLevelHits: 1,
+			Errors:       1,
+		},
+		{
+			Service:      "A2",
+			Resource:     "resource2",
+			Type:         "db",
+			Name:         "query",
+			Duration:     30,
+			Hits:         1,
+			TopLevelHits: 1,
+			Errors:       1,
+		},
+		{
+			Service:      "A2",
+			Resource:     "resourcefoo",
+			Type:         "db",
+			Name:         "query",
+			Duration:     3600000000000,
+			Hits:         1,
+			TopLevelHits: 1,
+			Errors:       0,
+		},
 	}
-	expectedCountValByKeyByTime[alignedNow] = map[string]int64{
-		"query|duration|env:none,resource:resource2,service:A1": 24,
-		"query|errors|env:none,resource:resource2,service:A1":   0,
-		"query|hits|env:none,resource:resource2,service:A1":     1,
+	// last bucket to be flushed
+	expectedCountValByKeyByTime[alignedNow] = []pb.ClientGroupedStats{
+		{
+			Service:      "A1",
+			Resource:     "resource2",
+			Type:         "db",
+			Name:         "query",
+			Duration:     24,
+			Hits:         1,
+			TopLevelHits: 1,
+			Errors:       0,
+		},
 	}
-	expectedCountValByKeyByTime[alignedNow+testBucketInterval] = map[string]int64{}
+	expectedCountValByKeyByTime[alignedNow+testBucketInterval] = []pb.ClientGroupedStats{}
 
 	traceutil.ComputeTopLevel(trace)
 	wt := NewWeightedTrace(trace, traceutil.GetRoot(trace))
@@ -283,10 +401,10 @@ func TestConcentratorStatsCounts(t *testing.T) {
 		Env:   "none",
 		Trace: wt,
 	}
-	c.Add(testTrace)
+	c.addNow(testTrace)
 
 	// flush every testBucketInterval
-	flushTime := now
+	flushTime := now.UnixNano()
 	for i := 0; i <= c.bufferLen+2; i++ {
 		t.Run(fmt.Sprintf("flush-%d", i), func(t *testing.T) {
 			stats := c.flushNow(flushTime)
@@ -296,31 +414,20 @@ func TestConcentratorStatsCounts(t *testing.T) {
 				// That's a flush for which we expect no data
 				return
 			}
-
-			if !assert.Equal(1, len(stats), "We should get exactly 1 Bucket") {
+			if !assert.Equal(1, len(stats.Stats), "We should get exactly 1 Bucket") {
 				t.FailNow()
 			}
-
-			receivedBuckets := []Bucket{stats[0]}
-
-			assert.Equal(expectedFlushedTs, receivedBuckets[0].Start)
-
+			assert.Equal(uint64(expectedFlushedTs), stats.Stats[0].Stats[0].Start)
 			expectedCountValByKey := expectedCountValByKeyByTime[expectedFlushedTs]
-			receivedCounts := receivedBuckets[0].Counts
-
-			// verify we got all counts
-			assert.Equal(len(expectedCountValByKey), len(receivedCounts), "GOT %v", receivedCounts)
-			// verify values
-			for key, val := range expectedCountValByKey {
-				count, ok := receivedCounts[key]
-				assert.True(ok, "%s was expected from concentrator", key)
-				assert.Equal(val, int64(count.Value), "Wrong value for count %s", key)
-			}
+			assertCountsEqual(t, expectedCountValByKey, stats.Stats[0].Stats[0].Stats)
+			assert.Equal("hostname", stats.AgentHostname)
+			assert.Equal("env", stats.AgentEnv)
+			assert.Equal("0.99.0", stats.AgentVersion)
+			assert.Equal(false, stats.ClientComputed)
 
 			// Flushing again at the same time should return nothing
 			stats = c.flushNow(flushTime)
-
-			if !assert.Equal(0, len(stats), "Second flush of the same time should be empty") {
+			if !assert.Equal(0, len(stats.Stats), "Second flush of the same time should be empty") {
 				t.FailNow()
 			}
 
@@ -329,89 +436,57 @@ func TestConcentratorStatsCounts(t *testing.T) {
 	}
 }
 
-// TestConcentratorSublayersStatsCounts tests exhaustively the sublayer stats of a single time window.
-func TestConcentratorSublayersStatsCounts(t *testing.T) {
+func generateDistribution(t *testing.T, generator func(i int) int64) *ddsketch.DDSketch {
 	assert := assert.New(t)
-	statsChan := make(chan []Bucket)
-	c := NewConcentrator([]string{}, testBucketInterval, statsChan)
-
-	now := time.Now().UnixNano()
-	alignedNow := now - now%c.bsize
-
-	trace := pb.Trace{
-		// first bucket
-		testSpan(1, 0, 2000, 0, "A1", "resource1", 0),
-		testSpan(2, 1, 1000, 0, "A2", "resource2", 0),
-		testSpan(3, 1, 1000, 0, "A2", "resource3", 0),
-		testSpan(4, 2, 40, 0, "A3", "resource4", 0),
-		testSpan(5, 4, 300, 0, "A3", "resource5", 0),
-		testSpan(6, 2, 30, 0, "A3", "resource6", 0),
+	now := time.Now()
+	c := NewTestConcentrator(now)
+	alignedNow := alignTs(now.UnixNano(), c.bsize)
+	// update oldestTs as it running for quite some time, to avoid the fact that at startup
+	// it only allows recent stats.
+	c.oldestTs = alignedNow - int64(c.bufferLen)*c.bsize
+	// Build a trace with stats representing the distribution given by the generator
+	trace := pb.Trace{}
+	for i := 0; i < 100; i++ {
+		trace = append(trace, testSpan(uint64(i)+1, 0, generator(i), 0, "A1", "resource1", 0))
 	}
 	traceutil.ComputeTopLevel(trace)
-	wt := NewWeightedTrace(trace, traceutil.GetRoot(trace))
+	c.addNow(&Input{Env: "none", Trace: NewWeightedTrace(trace, traceutil.GetRoot(trace))})
+	stats := c.flushNow(now.UnixNano() + c.bsize*int64(c.bufferLen))
+	expectedFlushedTs := alignedNow
+	assert.Len(stats.Stats, 1)
+	assert.Len(stats.Stats[0].Stats, 1)
+	assert.Equal(uint64(expectedFlushedTs), stats.Stats[0].Stats[0].Start)
+	assert.Len(stats.Stats[0].Stats, 1)
+	b := stats.Stats[0].Stats[0].Stats[0].OkSummary
+	var msg sketchpb.DDSketch
+	err := proto.Unmarshal(b, &msg)
+	assert.Nil(err)
+	// TODO(piochelepiotr): update library so that FromProto doesn't require to create a struct before.
+	sketch := ddsketch.DDSketch{}
+	summary, err := sketch.FromProto(&msg)
+	assert.Nil(err)
+	return summary
+}
 
-	subtraces := ExtractTopLevelSubtraces(trace, traceutil.GetRoot(trace))
-	sublayers := make(map[*pb.Span][]SublayerValue)
-	for _, subtrace := range subtraces {
-		subtraceSublayers := ComputeSublayers(subtrace.Trace)
-		sublayers[subtrace.Root] = subtraceSublayers
-	}
-
-	testTrace := &Input{
-		Env:       "none",
-		Trace:     wt,
-		Sublayers: sublayers,
-	}
-
-	c.Add(testTrace)
-	stats := c.flushNow(alignedNow + int64(c.bufferLen)*c.bsize)
-
-	if !assert.Equal(1, len(stats), "We should get exactly 1 Bucket") {
-		t.FailNow()
-	}
-
-	assert.Equal(alignedNow, stats[0].Start)
-
-	var receivedCounts map[string]Count
-
-	// Start with the first/older bucket
-	receivedCounts = stats[0].Counts
-	expectedCountValByKey := map[string]int64{
-		"query|_sublayers.duration.by_service|env:none,resource:resource1,service:A1,sublayer_service:A1": 2000,
-		"query|_sublayers.duration.by_service|env:none,resource:resource1,service:A1,sublayer_service:A2": 2000,
-		"query|_sublayers.duration.by_service|env:none,resource:resource1,service:A1,sublayer_service:A3": 370,
-		"query|_sublayers.duration.by_service|env:none,resource:resource4,service:A3,sublayer_service:A3": 340,
-		"query|_sublayers.duration.by_service|env:none,resource:resource2,service:A2,sublayer_service:A2": 1000,
-		"query|_sublayers.duration.by_service|env:none,resource:resource2,service:A2,sublayer_service:A3": 370,
-		"query|_sublayers.duration.by_type|env:none,resource:resource1,service:A1,sublayer_type:db":       4370,
-		"query|_sublayers.duration.by_type|env:none,resource:resource2,service:A2,sublayer_type:db":       1370,
-		"query|_sublayers.duration.by_type|env:none,resource:resource4,service:A3,sublayer_type:db":       340,
-		"query|_sublayers.span_count|env:none,resource:resource1,service:A1,:":                            6,
-		"query|_sublayers.span_count|env:none,resource:resource2,service:A2,:":                            4,
-		"query|_sublayers.span_count|env:none,resource:resource4,service:A3,:":                            2,
-		"query|duration|env:none,resource:resource1,service:A1":                                           2000,
-		"query|duration|env:none,resource:resource2,service:A2":                                           1000,
-		"query|duration|env:none,resource:resource3,service:A2":                                           1000,
-		"query|duration|env:none,resource:resource4,service:A3":                                           40,
-		"query|duration|env:none,resource:resource6,service:A3":                                           30,
-		"query|errors|env:none,resource:resource1,service:A1":                                             0,
-		"query|errors|env:none,resource:resource2,service:A2":                                             0,
-		"query|errors|env:none,resource:resource3,service:A2":                                             0,
-		"query|errors|env:none,resource:resource4,service:A3":                                             0,
-		"query|errors|env:none,resource:resource6,service:A3":                                             0,
-		"query|hits|env:none,resource:resource1,service:A1":                                               1,
-		"query|hits|env:none,resource:resource2,service:A2":                                               1,
-		"query|hits|env:none,resource:resource3,service:A2":                                               1,
-		"query|hits|env:none,resource:resource4,service:A3":                                               1,
-		"query|hits|env:none,resource:resource6,service:A3":                                               1,
-	}
-
-	// verify we got all counts
-	assert.Equal(len(expectedCountValByKey), len(receivedCounts), "GOT %v", receivedCounts)
-	// verify values
-	for key, val := range expectedCountValByKey {
-		count, ok := receivedCounts[key]
-		assert.True(ok, "%s was expected from concentrator", key)
-		assert.Equal(val, int64(count.Value), "Wrong value for count %s", key)
-	}
+func TestDistributions(t *testing.T) {
+	assert := assert.New(t)
+	testQuantiles := []float64{0.1, 0.5, 0.95, 0.99, 1}
+	t.Run("constant", func(t *testing.T) {
+		constantDistribution := generateDistribution(t, func(i int) int64 { return 42 })
+		expectedConstant := []float64{42, 42, 42, 42, 42}
+		for i, q := range testQuantiles {
+			actual, err := constantDistribution.GetValueAtQuantile(q)
+			assert.Nil(err)
+			assert.InEpsilon(expectedConstant[i], actual, 0.015)
+		}
+	})
+	t.Run("uniform", func(t *testing.T) {
+		uniformDistribution := generateDistribution(t, func(i int) int64 { return int64(i) + 1 })
+		expectedUniform := []float64{10, 50, 95, 99, 100}
+		for i, q := range testQuantiles {
+			actual, err := uniformDistribution.GetValueAtQuantile(q)
+			assert.Nil(err)
+			assert.InEpsilon(expectedUniform[i], actual, 0.015)
+		}
+	})
 }

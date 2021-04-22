@@ -1,6 +1,13 @@
+// Unless explicitly stated otherwise all files in this repository are licensed
+// under the Apache License Version 2.0.
+// This product includes software developed at Datadog (https://www.datadoghq.com/).
+// Copyright 2016-present Datadog, Inc.
+
 package filters
 
 import (
+	"strconv"
+
 	"github.com/DataDog/datadog-agent/pkg/trace/config"
 	"github.com/DataDog/datadog-agent/pkg/trace/pb"
 )
@@ -17,10 +24,10 @@ func NewReplacer(rules []*config.ReplaceRule) *Replacer {
 }
 
 // Replace replaces all tags matching the Replacer's rules.
-func (f Replacer) Replace(trace *pb.Trace) {
+func (f Replacer) Replace(trace pb.Trace) {
 	for _, rule := range f.rules {
 		key, str, re := rule.Name, rule.Repl, rule.Re
-		for _, s := range *trace {
+		for _, s := range trace {
 			switch key {
 			case "*":
 				for k := range s.Meta {
@@ -37,6 +44,25 @@ func (f Replacer) Replace(trace *pb.Trace) {
 					continue
 				}
 				s.Meta[key] = re.ReplaceAllString(s.Meta[key], str)
+			}
+		}
+	}
+}
+
+// ReplaceStatsGroup applies the replacer rules to the given stats bucket group.
+func (f Replacer) ReplaceStatsGroup(b *pb.ClientGroupedStats) {
+	for _, rule := range f.rules {
+		key, str, re := rule.Name, rule.Repl, rule.Re
+		switch key {
+		case "resource.name":
+			b.Resource = re.ReplaceAllString(b.Resource, str)
+		case "*":
+			b.Resource = re.ReplaceAllString(b.Resource, str)
+			fallthrough
+		case "http.status_code":
+			strcode := re.ReplaceAllString(strconv.Itoa(int(b.HTTPStatusCode)), str)
+			if code, err := strconv.Atoi(strcode); err == nil {
+				b.HTTPStatusCode = uint32(code)
 			}
 		}
 	}

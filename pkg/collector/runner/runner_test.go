@@ -1,7 +1,7 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2016-2019 Datadog, Inc.
+// Copyright 2016-present Datadog, Inc.
 
 package runner
 
@@ -16,12 +16,13 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/DataDog/datadog-agent/pkg/autodiscovery/integration"
 	"github.com/DataDog/datadog-agent/pkg/collector/check"
+	"github.com/DataDog/datadog-agent/pkg/config"
 )
 
 // FIXTURE
 type TestCheck struct {
+	check.StubCheck
 	sync.Mutex
 	doErr  bool
 	hasRun bool
@@ -37,11 +38,6 @@ func newTestCheck(doErr bool, id string) *TestCheck {
 	}
 }
 
-func (c *TestCheck) String() string                                     { return "TestCheck" }
-func (c *TestCheck) Version() string                                    { return "" }
-func (c *TestCheck) Stop()                                              {}
-func (c *TestCheck) Configure(integration.Data, integration.Data) error { return nil }
-func (c *TestCheck) Interval() time.Duration                            { return 1 }
 func (c *TestCheck) Run() error {
 	c.Lock()
 	defer c.Unlock()
@@ -54,13 +50,16 @@ func (c *TestCheck) Run() error {
 	c.hasRun = true
 	return nil
 }
+func (c *TestCheck) String() string {
+	return "TestCheck"
+}
 func (c *TestCheck) ID() check.ID {
 	c.Lock()
 	defer c.Unlock()
 	return check.ID(fmt.Sprintf("%s:%s", c.String(), c.id))
 }
-func (c *TestCheck) GetWarnings() []error                      { return nil }
-func (c *TestCheck) GetMetricStats() (map[string]int64, error) { return make(map[string]int64), nil }
+func (c *TestCheck) GetWarnings() []error                 { return nil }
+func (c *TestCheck) GetStats() (check.SenderStats, error) { return check.NewSenderStats(), nil }
 func (c *TestCheck) HasRun() bool {
 	c.Lock()
 	defer c.Unlock()
@@ -115,6 +114,10 @@ func TestWork(t *testing.T) {
 }
 
 func TestLogging(t *testing.T) {
+	defaultFrequency := config.Datadog.GetInt64("logging_frequency")
+	config.Datadog.SetDefault("logging_frequency", int64(20))
+	defer config.Datadog.SetDefault("logging_frequency", defaultFrequency)
+
 	r := NewRunner()
 	c := newTestCheck(false, "1")
 	s := &check.Stats{

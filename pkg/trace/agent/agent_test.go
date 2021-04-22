@@ -1,100 +1,40 @@
+// Unless explicitly stated otherwise all files in this repository are licensed
+// under the Apache License Version 2.0.
+// This product includes software developed at Datadog (https://www.datadoghq.com/).
+// Copyright 2016-present Datadog, Inc.
+
 package agent
 
 import (
+	"bytes"
 	"context"
-	"fmt"
+	"io/ioutil"
 	"math"
 	"net/http"
+	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"regexp"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/DataDog/datadog-agent/pkg/trace/event"
-	"github.com/DataDog/datadog-agent/pkg/trace/pb"
-	"github.com/DataDog/datadog-agent/pkg/trace/traceutil"
-	"github.com/cihub/seelog"
-	"github.com/stretchr/testify/assert"
-
+	"github.com/DataDog/datadog-agent/pkg/trace/api"
 	"github.com/DataDog/datadog-agent/pkg/trace/config"
+	"github.com/DataDog/datadog-agent/pkg/trace/event"
+	"github.com/DataDog/datadog-agent/pkg/trace/filters"
 	"github.com/DataDog/datadog-agent/pkg/trace/info"
 	"github.com/DataDog/datadog-agent/pkg/trace/obfuscate"
+	"github.com/DataDog/datadog-agent/pkg/trace/pb"
 	"github.com/DataDog/datadog-agent/pkg/trace/sampler"
 	"github.com/DataDog/datadog-agent/pkg/trace/test/testutil"
+	"github.com/DataDog/datadog-agent/pkg/trace/traceutil"
+	"github.com/DataDog/datadog-agent/pkg/trace/writer"
+	ddlog "github.com/DataDog/datadog-agent/pkg/util/log"
+
+	"github.com/cihub/seelog"
+	"github.com/stretchr/testify/assert"
 )
-
-type mockSamplerEngine struct {
-	engine sampler.Engine
-}
-
-func newMockSampler(wantSampled bool, wantRate float64) *Sampler {
-	return &Sampler{engine: testutil.NewMockEngine(wantSampled, wantRate)}
-}
-
-func TestWatchdog(t *testing.T) {
-	if testing.Short() {
-		return
-	}
-
-	conf := config.New()
-	conf.Endpoints[0].APIKey = "apikey_2"
-	conf.MaxMemory = 1e7
-	conf.WatchdogInterval = time.Millisecond
-
-	// save the global mux aside, we don't want to break other tests
-	defaultMux := http.DefaultServeMux
-	http.DefaultServeMux = http.NewServeMux()
-
-	ctx, cancelFunc := context.WithCancel(context.Background())
-	agnt := NewAgent(ctx, conf)
-
-	defer func() {
-		cancelFunc()
-		// We need to manually close the receiver as the Run() func
-		// should have been broken and interrupted by the watchdog panic
-		agnt.Receiver.Stop()
-		http.DefaultServeMux = defaultMux
-	}()
-
-	var killed bool
-	defer func() {
-		if r := recover(); r != nil {
-			killed = true
-			switch v := r.(type) {
-			case string:
-				if strings.HasPrefix(v, "exceeded max memory") {
-					t.Logf("watchdog worked, trapped the right error: %s", v)
-					runtime.GC() // make sure we clean up after allocating all this
-					return
-				}
-			}
-			t.Fatalf("unexpected error: %v", r)
-		}
-	}()
-
-	// allocating a lot of memory
-	buf := make([]byte, 2*int64(conf.MaxMemory))
-	buf[0] = 1
-	buf[len(buf)-1] = 1
-
-	// override the default die, else our test would stop, use a plain panic() instead
-	oldDie := dieFunc
-	defer func() { dieFunc = oldDie }()
-	dieFunc = func(format string, args ...interface{}) {
-		panic(fmt.Sprintf(format, args...))
-	}
-
-	// after some time, the watchdog should kill this
-	agnt.Run()
-
-	// without this. runtime could be smart and free memory before we Run()
-	buf[0] = 2
-	buf[len(buf)-1] = 2
-
-	assert.True(t, killed)
-}
 
 // Test to make sure that the joined effort of the quantizer and truncator, in that order, produce the
 // desired string
@@ -126,8 +66,8 @@ func TestProcess(t *testing.T) {
 	t.Run("Replacer", func(t *testing.T) {
 		// Ensures that for "sql" type spans:
 		// • obfuscator runs before replacer
-		// • obfuscator obfuscates both resource and "sql.query" tag
-		// • resulting resource is obfuscated with replacements applied
+		// • obfuscator obfuscates both resource and "sql.query" tag
+		// • resulting resource is obfuscated with replacements applied
 		// • resulting "sql.query" tag is obfuscated with no replacements applied
 		cfg := config.New()
 		cfg.Endpoints[0].APIKey = "test"
@@ -142,12 +82,17 @@ func TestProcess(t *testing.T) {
 
 		now := time.Now()
 		span := &pb.Span{
+			TraceID:  1,
+			SpanID:   1,
 			Resource: "SELECT name FROM people WHERE age = 42 AND extra = 55",
 			Type:     "sql",
 			Start:    now.Add(-time.Second).UnixNano(),
 			Duration: (500 * time.Millisecond).Nanoseconds(),
 		}
-		agnt.Process(pb.Trace{span})
+		agnt.Process(&api.Payload{
+			Traces: pb.Traces{{span}},
+			Source: info.NewReceiverStats().GetTagStats(info.Tags{}),
+		})
 
 		assert := assert.New(t)
 		assert.Equal("SELECT name FROM people WHERE age = ? ...", span.Resource)
@@ -164,28 +109,109 @@ func TestProcess(t *testing.T) {
 
 		now := time.Now()
 		spanValid := &pb.Span{
+			TraceID:  1,
+			SpanID:   1,
 			Resource: "SELECT name FROM people WHERE age = 42 AND extra = 55",
 			Type:     "sql",
 			Start:    now.Add(-time.Second).UnixNano(),
 			Duration: (500 * time.Millisecond).Nanoseconds(),
 		}
 		spanInvalid := &pb.Span{
+			TraceID:  1,
+			SpanID:   1,
 			Resource: "INSERT INTO db VALUES (1, 2, 3)",
 			Type:     "sql",
 			Start:    now.Add(-time.Second).UnixNano(),
 			Duration: (500 * time.Millisecond).Nanoseconds(),
 		}
 
-		stats := agnt.Receiver.Stats.GetTagStats(info.Tags{})
+		want := agnt.Receiver.Stats.GetTagStats(info.Tags{})
 		assert := assert.New(t)
 
-		agnt.Process(pb.Trace{spanValid})
-		assert.EqualValues(0, stats.TracesFiltered)
-		assert.EqualValues(0, stats.SpansFiltered)
+		agnt.Process(&api.Payload{
+			Traces: pb.Traces{{spanValid}},
+			Source: want,
+		})
+		assert.EqualValues(0, want.TracesFiltered)
+		assert.EqualValues(0, want.SpansFiltered)
 
-		agnt.Process(pb.Trace{spanInvalid, spanInvalid})
-		assert.EqualValues(1, stats.TracesFiltered)
-		assert.EqualValues(2, stats.SpansFiltered)
+		agnt.Process(&api.Payload{
+			Traces: pb.Traces{{spanInvalid, spanInvalid}},
+			Source: want,
+		})
+		assert.EqualValues(1, want.TracesFiltered)
+		assert.EqualValues(2, want.SpansFiltered)
+	})
+
+	t.Run("BlacklistPayload", func(t *testing.T) {
+		// Regression test for DataDog/datadog-agent#6500
+		cfg := config.New()
+		cfg.Endpoints[0].APIKey = "test"
+		cfg.Ignore["resource"] = []string{"^INSERT.*"}
+		ctx, cancel := context.WithCancel(context.Background())
+		agnt := NewAgent(ctx, cfg)
+		defer cancel()
+
+		now := time.Now()
+		spanValid := &pb.Span{
+			TraceID:  1,
+			SpanID:   1,
+			Resource: "SELECT name FROM people WHERE age = 42 AND extra = 55",
+			Type:     "sql",
+			Start:    now.Add(-time.Second).UnixNano(),
+			Duration: (500 * time.Millisecond).Nanoseconds(),
+		}
+		spanInvalid := &pb.Span{
+			TraceID:  1,
+			SpanID:   1,
+			Resource: "INSERT INTO db VALUES (1, 2, 3)",
+			Type:     "sql",
+			Start:    now.Add(-time.Second).UnixNano(),
+			Duration: (500 * time.Millisecond).Nanoseconds(),
+		}
+
+		want := agnt.Receiver.Stats.GetTagStats(info.Tags{})
+		assert := assert.New(t)
+
+		agnt.Process(&api.Payload{
+			Traces: pb.Traces{{spanInvalid, spanInvalid}, {spanValid}},
+			Source: want,
+		})
+		assert.EqualValues(1, want.TracesFiltered)
+		assert.EqualValues(2, want.SpansFiltered)
+		var span *pb.Span
+		select {
+		case ss := <-agnt.TraceWriter.In:
+			span = ss.Traces[0].Spans[0]
+		case <-time.After(2 * time.Second):
+			t.Fatal("timeout: Expected one valid trace, but none were received.")
+		}
+		assert.Equal("unnamed_operation", span.Name)
+	})
+
+	t.Run("ContainerTags", func(t *testing.T) {
+		cfg := config.New()
+		cfg.Endpoints[0].APIKey = "test"
+		ctx, cancel := context.WithCancel(context.Background())
+		agnt := NewAgent(ctx, cfg)
+		defer cancel()
+
+		span := &pb.Span{
+			TraceID:  1,
+			SpanID:   1,
+			Resource: "INSERT INTO db VALUES (1, 2, 3)",
+			Type:     "sql",
+			Start:    time.Now().Unix(),
+			Duration: (500 * time.Millisecond).Nanoseconds(),
+		}
+
+		agnt.Process(&api.Payload{
+			Traces:        pb.Traces{{span}},
+			Source:        info.NewReceiverStats().GetTagStats(info.Tags{}),
+			ContainerTags: "A:B,C",
+		})
+
+		assert.Equal(t, "A:B,C", span.Meta[tagContainersTags])
 	})
 
 	t.Run("Stats/Priority", func(t *testing.T) {
@@ -195,6 +221,7 @@ func TestProcess(t *testing.T) {
 		agnt := NewAgent(ctx, cfg)
 		defer cancel()
 
+		want := agnt.Receiver.Stats.GetTagStats(info.Tags{})
 		now := time.Now()
 		for _, key := range []sampler.SamplingPriority{
 			sampler.PriorityNone,
@@ -214,6 +241,8 @@ func TestProcess(t *testing.T) {
 			sampler.PriorityUserKeep,
 		} {
 			span := &pb.Span{
+				TraceID:  1,
+				SpanID:   1,
 				Resource: "SELECT name FROM people WHERE age = 42 AND extra = 55",
 				Type:     "sql",
 				Start:    now.Add(-time.Second).UnixNano(),
@@ -223,15 +252,302 @@ func TestProcess(t *testing.T) {
 			if key != sampler.PriorityNone {
 				sampler.SetSamplingPriority(span, key)
 			}
-			agnt.Process(pb.Trace{span})
+			agnt.Process(&api.Payload{
+				Traces: pb.Traces{{span}},
+				Source: want,
+			})
 		}
 
-		stats := agnt.Receiver.Stats.GetTagStats(info.Tags{})
-		assert.EqualValues(t, 1, stats.TracesPriorityNone)
-		assert.EqualValues(t, 2, stats.TracesPriorityNeg)
-		assert.EqualValues(t, 3, stats.TracesPriority0)
-		assert.EqualValues(t, 4, stats.TracesPriority1)
-		assert.EqualValues(t, 5, stats.TracesPriority2)
+		assert.EqualValues(t, 1, want.TracesPriorityNone)
+		assert.EqualValues(t, 2, want.TracesPriorityNeg)
+		assert.EqualValues(t, 3, want.TracesPriority0)
+		assert.EqualValues(t, 4, want.TracesPriority1)
+		assert.EqualValues(t, 5, want.TracesPriority2)
+	})
+
+	t.Run("GlobalTags", func(t *testing.T) {
+		cfg := config.New()
+		cfg.GlobalTags["_dd.test"] = "value"
+		cfg.Endpoints[0].APIKey = "test"
+		ctx, cancel := context.WithCancel(context.Background())
+		agnt := NewAgent(ctx, cfg)
+		defer cancel()
+		now := time.Now()
+		span := &pb.Span{
+			TraceID:  1,
+			SpanID:   1,
+			Resource: "SELECT name FROM people WHERE age = 42 AND extra = 55",
+			Type:     "sql",
+			Start:    now.Add(-time.Second).UnixNano(),
+			Duration: (500 * time.Millisecond).Nanoseconds(),
+		}
+		agnt.Process(&api.Payload{
+			Traces: pb.Traces{{span}},
+			Source: info.NewReceiverStats().GetTagStats(info.Tags{}),
+		})
+
+		assert := assert.New(t)
+		assert.Equal("value", span.GetMeta()["_dd.test"])
+	})
+
+	t.Run("normalizing", func(t *testing.T) {
+		cfg := config.New()
+		cfg.Endpoints[0].APIKey = "test"
+		ctx, cancel := context.WithCancel(context.Background())
+		agnt := NewAgent(ctx, cfg)
+		defer cancel()
+
+		traces := pb.Traces{{{
+			Service:  "something &&<@# that should be a metric!",
+			TraceID:  1,
+			SpanID:   1,
+			Resource: "SELECT name FROM people WHERE age = 42 AND extra = 55",
+			Type:     "sql",
+			Start:    time.Now().Add(-time.Second).UnixNano(),
+			Duration: (500 * time.Millisecond).Nanoseconds(),
+			Metrics:  map[string]float64{sampler.KeySamplingPriority: 2},
+		}}}
+		go agnt.Process(&api.Payload{
+			Traces: traces,
+			Source: agnt.Receiver.Stats.GetTagStats(info.Tags{}),
+		})
+		timeout := time.After(2 * time.Second)
+		var span *pb.Span
+		select {
+		case ss := <-agnt.TraceWriter.In:
+			span = ss.Traces[0].Spans[0]
+		case <-timeout:
+			t.Fatal("timed out")
+		}
+		assert.Equal(t, "unnamed_operation", span.Name)
+		assert.Equal(t, "something_that_should_be_a_metric", span.Service)
+	})
+
+	t.Run("chunking", func(t *testing.T) {
+		cfg := config.New()
+		cfg.Endpoints[0].APIKey = "test"
+		ctx, cancel := context.WithCancel(context.Background())
+		agnt := NewAgent(ctx, cfg)
+		defer cancel()
+
+		trace := pb.Trace{{
+			TraceID:  1,
+			SpanID:   1,
+			Resource: "SELECT name FROM people WHERE age = 42 AND extra = 55",
+			Type:     "sql",
+			Start:    time.Now().Add(-time.Second).UnixNano(),
+			Duration: (500 * time.Millisecond).Nanoseconds(),
+			Metrics:  map[string]float64{sampler.KeySamplingPriority: 2},
+		}}
+		// we are sending 3 traces
+		traces := pb.Traces{trace, trace, trace}
+		// setting writer.MaxPayloadSize to the size of 1 trace (+1 byte)
+		defer func(oldSize int) { writer.MaxPayloadSize = oldSize }(writer.MaxPayloadSize)
+		writer.MaxPayloadSize = trace.Msgsize() + 1
+		// and expecting it to result in 3 payloads
+		expectedPayloads := 3
+		go agnt.Process(&api.Payload{
+			Traces: traces,
+			Source: agnt.Receiver.Stats.GetTagStats(info.Tags{}),
+		})
+
+		var gotCount int
+		timeout := time.After(3 * time.Second)
+		// expect multiple payloads
+		for i := 0; i < expectedPayloads; i++ {
+			select {
+			case ss := <-agnt.TraceWriter.In:
+				gotCount += int(ss.SpanCount)
+			case <-timeout:
+				t.Fatal("timed out")
+			}
+		}
+		// without missing a trace
+		assert.Equal(t, gotCount, len(traces))
+	})
+}
+
+func TestClientComputedTopLevel(t *testing.T) {
+	cfg := config.New()
+	cfg.Endpoints[0].APIKey = "test"
+	ctx, cancel := context.WithCancel(context.Background())
+	agnt := NewAgent(ctx, cfg)
+	defer cancel()
+	traces := pb.Traces{{{
+		Service:  "something &&<@# that should be a metric!",
+		TraceID:  1,
+		SpanID:   1,
+		Resource: "SELECT name FROM people WHERE age = 42 AND extra = 55",
+		Type:     "sql",
+		Start:    time.Now().Add(-time.Second).UnixNano(),
+		Duration: (500 * time.Millisecond).Nanoseconds(),
+		Metrics:  map[string]float64{sampler.KeySamplingPriority: 2},
+	}}}
+
+	t.Run("onNotTop", func(t *testing.T) {
+		go agnt.Process(&api.Payload{
+			Traces:                 traces,
+			Source:                 agnt.Receiver.Stats.GetTagStats(info.Tags{}),
+			ClientComputedTopLevel: true,
+		})
+		timeout := time.After(time.Second)
+		select {
+		case ss := <-agnt.TraceWriter.In:
+			_, ok := ss.Traces[0].Spans[0].Metrics["_top_level"]
+			assert.False(t, ok)
+			return
+		case <-timeout:
+			t.Fatal("timed out waiting for input")
+		}
+	})
+
+	t.Run("off", func(t *testing.T) {
+		go agnt.Process(&api.Payload{
+			Traces:                 traces,
+			Source:                 agnt.Receiver.Stats.GetTagStats(info.Tags{}),
+			ClientComputedTopLevel: false,
+		})
+		timeout := time.After(time.Second)
+		select {
+		case ss := <-agnt.TraceWriter.In:
+			_, ok := ss.Traces[0].Spans[0].Metrics["_top_level"]
+			assert.True(t, ok)
+			return
+		case <-timeout:
+			t.Fatal("timed out waiting for input")
+		}
+	})
+
+	t.Run("onTop", func(t *testing.T) {
+		traces[0][0].Metrics["_dd.top_level"] = 1
+		go agnt.Process(&api.Payload{
+			Traces:                 traces,
+			Source:                 agnt.Receiver.Stats.GetTagStats(info.Tags{}),
+			ClientComputedTopLevel: true,
+		})
+		timeout := time.After(time.Second)
+		select {
+		case ss := <-agnt.TraceWriter.In:
+			_, ok := ss.Traces[0].Spans[0].Metrics["_top_level"]
+			assert.True(t, ok)
+			_, ok = ss.Traces[0].Spans[0].Metrics["_dd.top_level"]
+			assert.True(t, ok)
+			return
+		case <-timeout:
+			t.Fatal("timed out waiting for input")
+		}
+	})
+}
+
+func TestFilteredByTags(t *testing.T) {
+	for _, tt := range []struct {
+		require []*config.Tag
+		reject  []*config.Tag
+		span    pb.Span
+		drop    bool
+	}{
+		{
+			require: []*config.Tag{{K: "key", V: "val"}},
+			span:    pb.Span{Meta: map[string]string{"key": "val"}},
+			drop:    false,
+		},
+		{
+			reject: []*config.Tag{{K: "key", V: "val"}},
+			span:   pb.Span{Meta: map[string]string{"key": "val4"}},
+			drop:   false,
+		},
+		{
+			reject: []*config.Tag{{K: "something", V: "else"}},
+			span:   pb.Span{Meta: map[string]string{"key": "val"}},
+			drop:   false,
+		},
+		{
+			require: []*config.Tag{{K: "something", V: "else"}},
+			reject:  []*config.Tag{{K: "bad-key", V: "bad-value"}},
+			span:    pb.Span{Meta: map[string]string{"something": "else", "bad-key": "other-value"}},
+			drop:    false,
+		},
+		{
+			require: []*config.Tag{{K: "key", V: "value"}, {K: "key-only"}},
+			reject:  []*config.Tag{{K: "bad-key", V: "bad-value"}},
+			span:    pb.Span{Meta: map[string]string{"key": "value", "key-only": "but-also-value", "bad-key": "not-bad-value"}},
+			drop:    false,
+		},
+		{
+			require: []*config.Tag{{K: "key", V: "val"}},
+			span:    pb.Span{Meta: map[string]string{"key": "val2"}},
+			drop:    true,
+		},
+		{
+			require: []*config.Tag{{K: "something", V: "else"}},
+			span:    pb.Span{Meta: map[string]string{"key": "val"}},
+			drop:    true,
+		},
+		{
+			require: []*config.Tag{{K: "valid"}, {K: "test"}},
+			reject:  []*config.Tag{{K: "test"}},
+			span:    pb.Span{Meta: map[string]string{"test": "random", "valid": "random"}},
+			drop:    true,
+		},
+		{
+			require: []*config.Tag{{K: "valid-key", V: "valid-value"}, {K: "test"}},
+			reject:  []*config.Tag{{K: "test"}},
+			span:    pb.Span{Meta: map[string]string{"test": "random", "valid-key": "wrong-value"}},
+			drop:    true,
+		},
+		{
+			reject: []*config.Tag{{K: "key", V: "val"}},
+			span:   pb.Span{Meta: map[string]string{"key": "val"}},
+			drop:   true,
+		},
+		{
+			require: []*config.Tag{{K: "something", V: "else"}, {K: "key-only"}},
+			reject:  []*config.Tag{{K: "bad-key", V: "bad-value"}, {K: "bad-key-only"}},
+			span:    pb.Span{Meta: map[string]string{"something": "else", "key-only": "but-also-value", "bad-key-only": "random"}},
+			drop:    true,
+		},
+	} {
+		t.Run("", func(t *testing.T) {
+			if filteredByTags(&tt.span, tt.require, tt.reject) != tt.drop {
+				t.Fatal()
+			}
+		})
+	}
+}
+
+func TestClientComputedStats(t *testing.T) {
+	cfg := config.New()
+	cfg.Endpoints[0].APIKey = "test"
+	ctx, cancel := context.WithCancel(context.Background())
+	agnt := NewAgent(ctx, cfg)
+	defer cancel()
+	traces := pb.Traces{{{
+		Service:  "something &&<@# that should be a metric!",
+		TraceID:  1,
+		SpanID:   1,
+		Resource: "SELECT name FROM people WHERE age = 42 AND extra = 55",
+		Type:     "sql",
+		Start:    time.Now().Add(-time.Second).UnixNano(),
+		Duration: (500 * time.Millisecond).Nanoseconds(),
+		Metrics:  map[string]float64{sampler.KeySamplingPriority: 2},
+	}}}
+
+	t.Run("on", func(t *testing.T) {
+		agnt.Process(&api.Payload{
+			Traces:              traces,
+			Source:              agnt.Receiver.Stats.GetTagStats(info.Tags{}),
+			ClientComputedStats: true,
+		})
+		assert.Len(t, agnt.Concentrator.In, 0)
+	})
+
+	t.Run("off", func(t *testing.T) {
+		agnt.Process(&api.Payload{
+			Traces:              traces,
+			Source:              agnt.Receiver.Stats.GetTagStats(info.Tags{}),
+			ClientComputedStats: false,
+		})
+		assert.Len(t, agnt.Concentrator.In, 1)
 	})
 }
 
@@ -241,111 +557,84 @@ func TestSampling(t *testing.T) {
 		// hasPriority will be true if the input trace should have sampling priority set
 		hasErrors, hasPriority bool
 
-		// scoreRate, scoreErrorRate, priorityRate are the rates used by the mock samplers
-		scoreRate, scoreErrorRate, priorityRate float64
+		// noPrioritySampled, errorsSampled, prioritySampled are the sample decisions of the mock samplers
+		noPrioritySampled, errorsSampled, prioritySampled bool
 
-		// scoreSampled, scoreErrorSampled, prioritySampled are the sample decisions of the mock samplers
-		scoreSampled, scoreErrorSampled, prioritySampled bool
-
-		// wantRate and wantSampled are the expected result
-		wantRate    float64
+		// wantSampled is the expected result
 		wantSampled bool
 	}{
-		"score and priority rate": {
-			hasPriority:  true,
-			scoreRate:    0.5,
-			priorityRate: 0.6,
-			wantRate:     sampler.CombineRates(0.5, 0.6),
+		"nopriority-unsampled": {
+			noPrioritySampled: false,
+			wantSampled:       false,
 		},
-		"score only rate": {
-			scoreRate:    0.5,
-			priorityRate: 0.1,
-			wantRate:     0.5,
+		"nopriority-sampled": {
+			noPrioritySampled: true,
+			wantSampled:       true,
 		},
-		"error and priority rate": {
-			hasErrors:      true,
-			hasPriority:    true,
-			scoreErrorRate: 0.8,
-			priorityRate:   0.2,
-			wantRate:       sampler.CombineRates(0.8, 0.2),
-		},
-		"score not sampled decision": {
-			scoreSampled: false,
-			wantSampled:  false,
-		},
-		"score sampled decision": {
-			scoreSampled: true,
-			wantSampled:  true,
-		},
-		"score sampled priority not sampled": {
+		"prio-unsampled": {
 			hasPriority:     true,
-			scoreSampled:    true,
-			prioritySampled: false,
-			wantSampled:     true,
-		},
-		"score not sampled priority sampled": {
-			hasPriority:     true,
-			scoreSampled:    false,
-			prioritySampled: true,
-			wantSampled:     true,
-		},
-		"score sampled priority sampled": {
-			hasPriority:     true,
-			scoreSampled:    true,
-			prioritySampled: true,
-			wantSampled:     true,
-		},
-		"score and priority not sampled": {
-			hasPriority:     true,
-			scoreSampled:    false,
 			prioritySampled: false,
 			wantSampled:     false,
 		},
-		"error not sampled decision": {
-			hasErrors:         true,
-			scoreErrorSampled: false,
-			wantSampled:       false,
+		"prio-sampled": {
+			hasPriority:     true,
+			prioritySampled: true,
+			wantSampled:     true,
 		},
-		"error sampled decision": {
-			hasErrors:         true,
-			scoreErrorSampled: true,
-			wantSampled:       true,
+		"error-unsampled": {
+			hasErrors:     true,
+			errorsSampled: false,
+			wantSampled:   false,
 		},
-		"error sampled priority not sampled": {
-			hasErrors:         true,
-			hasPriority:       true,
-			scoreErrorSampled: true,
-			prioritySampled:   false,
-			wantSampled:       true,
+		"error-sampled": {
+			hasErrors:     true,
+			errorsSampled: true,
+			wantSampled:   true,
 		},
-		"error not sampled priority sampled": {
-			hasErrors:         true,
-			hasPriority:       true,
-			scoreErrorSampled: false,
-			prioritySampled:   true,
-			wantSampled:       true,
+		"error-sampled-prio-unsampled": {
+			hasErrors:       true,
+			hasPriority:     true,
+			errorsSampled:   true,
+			prioritySampled: false,
+			wantSampled:     true,
 		},
-		"error sampled priority sampled": {
-			hasErrors:         true,
-			hasPriority:       true,
-			scoreErrorSampled: true,
-			prioritySampled:   true,
-			wantSampled:       true,
+		"error-unsampled-prio-sampled": {
+			hasErrors:       true,
+			hasPriority:     true,
+			errorsSampled:   false,
+			prioritySampled: true,
+			wantSampled:     true,
 		},
-		"error and priority not sampled": {
-			hasErrors:         true,
-			hasPriority:       true,
-			scoreErrorSampled: false,
-			prioritySampled:   false,
-			wantSampled:       false,
+		"error-prio-sampled": {
+			hasErrors:       true,
+			hasPriority:     true,
+			errorsSampled:   true,
+			prioritySampled: true,
+			wantSampled:     true,
+		},
+		"error-prio-unsampled": {
+			hasErrors:       true,
+			hasPriority:     true,
+			errorsSampled:   false,
+			prioritySampled: false,
+			wantSampled:     false,
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
+			cfg := &config.AgentConfig{}
+			sampledCfg := &config.AgentConfig{ExtraSampleRate: 1}
 			a := &Agent{
-				ScoreSampler:       newMockSampler(tt.scoreSampled, tt.scoreRate),
-				ErrorsScoreSampler: newMockSampler(tt.scoreErrorSampled, tt.scoreErrorRate),
-				PrioritySampler:    newMockSampler(tt.prioritySampled, tt.priorityRate),
+				NoPrioritySampler: sampler.NewNoPrioritySampler(cfg),
+				ErrorsSampler:     sampler.NewErrorsSampler(cfg),
+				PrioritySampler:   sampler.NewPrioritySampler(cfg, &sampler.DynamicConfig{}),
 			}
+			if tt.errorsSampled {
+				a.ErrorsSampler = sampler.NewErrorsSampler(sampledCfg)
+			}
+			if tt.noPrioritySampled {
+				a.NoPrioritySampler = sampler.NewNoPrioritySampler(sampledCfg)
+			}
+
 			root := &pb.Span{
 				Service:  "serv1",
 				Start:    time.Now().UnixNano(),
@@ -358,11 +647,14 @@ func TestSampling(t *testing.T) {
 			}
 			pt := ProcessedTrace{Trace: pb.Trace{root}, Root: root}
 			if tt.hasPriority {
-				sampler.SetSamplingPriority(pt.Root, 1)
+				if tt.prioritySampled {
+					sampler.SetSamplingPriority(pt.Root, 1)
+				} else {
+					sampler.SetSamplingPriority(pt.Root, 0)
+				}
 			}
 
-			sampled, rate := a.sample(pt)
-			assert.EqualValues(t, tt.wantRate, rate)
+			sampled := a.runSamplers(pt, tt.hasPriority)
 			assert.EqualValues(t, tt.wantSampled, sampled)
 		})
 	}
@@ -463,7 +755,7 @@ type eventProcessorTestCase struct {
 
 func testEventProcessorFromConf(t *testing.T, conf *config.AgentConfig, testCase eventProcessorTestCase) {
 	t.Run(testCase.name, func(t *testing.T) {
-		processor := eventProcessorFromConf(conf)
+		processor := newEventProcessor(conf)
 		processor.Start()
 
 		actualEPS := generateTraffic(processor, testCase.serviceName, testCase.opName, testCase.extractionRate,
@@ -555,21 +847,10 @@ func runTraceProcessingBenchmark(b *testing.B, c *config.AgentConfig) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		ta.Process(testutil.RandomTrace(10, 8))
-	}
-}
-
-func BenchmarkWatchdog(b *testing.B) {
-	conf := config.New()
-	conf.Endpoints[0].APIKey = "apikey_2"
-	ctx, cancelFunc := context.WithCancel(context.Background())
-	defer cancelFunc()
-	ta := NewAgent(ctx, conf)
-
-	b.ResetTimer()
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		ta.watchdog()
+		ta.Process(&api.Payload{
+			Traces: pb.Traces{testutil.RandomTrace(10, 8)},
+			Source: info.NewReceiverStats().GetTagStats(info.Tags{}),
+		})
 	}
 }
 
@@ -580,4 +861,321 @@ func formatTrace(t pb.Trace) pb.Trace {
 		Truncate(span)
 	}
 	return t
+}
+
+func BenchmarkThroughput(b *testing.B) {
+	env, ok := os.LookupEnv("DD_TRACE_TEST_FOLDER")
+	if !ok {
+		b.SkipNow()
+	}
+
+	ddlog.SetupLogger(seelog.Disabled, "") // disable logging
+
+	folder := filepath.Join(env, "benchmarks")
+	filepath.Walk(folder, func(path string, info os.FileInfo, err error) error {
+		ext := filepath.Ext(path)
+		if ext != ".msgp" {
+			return nil
+		}
+		b.Run(info.Name(), benchThroughput(path))
+		return nil
+	})
+}
+
+func benchThroughput(file string) func(*testing.B) {
+	return func(b *testing.B) {
+		data, count, err := tracesFromFile(file)
+		if err != nil {
+			b.Fatal(err)
+		}
+		cfg := config.New()
+		cfg.Endpoints[0].APIKey = "irrelevant"
+
+		ctx, cancelFunc := context.WithCancel(context.Background())
+		http.DefaultServeMux = &http.ServeMux{}
+		agnt := NewAgent(ctx, cfg)
+		defer cancelFunc()
+
+		// start the agent without the trace and stats writers; we will be draining
+		// these channels ourselves in the benchmarks, plus we don't want the writers
+		// resource usage to show up in the results.
+		agnt.TraceWriter.In = make(chan *writer.SampledSpans)
+		go agnt.Run()
+
+		// wait for receiver to start:
+		for {
+			resp, err := http.Get("http://localhost:8126/v0.4/traces")
+			if err != nil {
+				time.Sleep(time.Millisecond)
+				continue
+			}
+			if resp.StatusCode == 400 {
+				break
+			}
+		}
+
+		// drain every other channel to avoid blockage.
+		exit := make(chan bool)
+		go func() {
+			defer close(exit)
+			for {
+				select {
+				case <-agnt.Concentrator.Out:
+				case <-exit:
+					return
+				}
+			}
+		}()
+
+		b.ResetTimer()
+		b.SetBytes(int64(len(data)))
+
+		for i := 0; i < b.N; i++ {
+			req, err := http.NewRequest("PUT", "http://localhost:8126/v0.4/traces", bytes.NewReader(data))
+			if err != nil {
+				b.Fatal(err)
+			}
+			req.Header.Set("Content-Type", "application/msgpack")
+			w := httptest.NewRecorder()
+
+			// create the request by calling directly into the Handler;
+			// we are not interested in benchmarking HTTP latency. This
+			// also ensures we avoid potential connection failures that
+			// would make the benchmarks inconsistent.
+			http.DefaultServeMux.ServeHTTP(w, req)
+			if w.Code != 200 {
+				b.Fatalf("%d: %v", i, w.Body.String())
+			}
+
+			var got int
+			timeout := time.After(1 * time.Second)
+		loop:
+			for {
+				select {
+				case <-agnt.TraceWriter.In:
+					got++
+					if got == count {
+						// processed everything!
+						break loop
+					}
+				case <-timeout:
+					// taking too long...
+					b.Fatalf("time out at %d/%d", got, count)
+					break loop
+				}
+			}
+		}
+
+		exit <- true
+		<-exit
+	}
+}
+
+// tracesFromFile extracts raw msgpack data from the given file, modifying each trace
+// to have sampling.priority=2 to guarantee consistency. It also returns the amount of
+// traces found and any error in obtaining the information.
+func tracesFromFile(file string) (raw []byte, count int, err error) {
+	if file[0] != '/' {
+		file = filepath.Join(os.Getenv("GOPATH"), file)
+	}
+	in, err := os.Open(file)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer in.Close()
+	// prepare the traces in this file by adding sampling.priority=2
+	// everywhere to ensure consistent sampling assumptions and results.
+	var traces pb.Traces
+	bts, err := ioutil.ReadAll(in)
+	if _, err = traces.UnmarshalMsg(bts); err != nil {
+		return nil, 0, err
+	}
+	for _, t := range traces {
+		count++
+		for _, s := range t {
+			if s.Metrics == nil {
+				s.Metrics = map[string]float64{"_sampling_priority_v1": 2}
+			} else {
+				s.Metrics["_sampling_priority_v1"] = 2
+			}
+		}
+	}
+	// re-encode the modified payload
+	var data []byte
+	if data, err = traces.MarshalMsg(nil); err != nil {
+		return nil, 0, err
+	}
+	return data, count, nil
+}
+
+func TestConvertStats(t *testing.T) {
+	testCases := []struct {
+		in            pb.ClientStatsPayload
+		lang          string
+		tracerVersion string
+		out           pb.ClientStatsPayload
+	}{
+		{
+			in: pb.ClientStatsPayload{
+				Hostname: "tracer_hots",
+				Env:      "tracer_env",
+				Version:  "code_version",
+				Stats: []pb.ClientStatsBucket{
+					{
+						Start:    1,
+						Duration: 2,
+						Stats: []pb.ClientGroupedStats{
+							{
+								Service:        "service",
+								Name:           "name------",
+								Resource:       "resource",
+								HTTPStatusCode: 400,
+								Type:           "web",
+							},
+							{
+								Service:        "service",
+								Name:           "name",
+								Resource:       "blocked_resource",
+								HTTPStatusCode: 400,
+								Type:           "web",
+							},
+							{
+								Service:        "redis_service",
+								Name:           "name-2",
+								Resource:       "SET k v",
+								HTTPStatusCode: 400,
+								Type:           "redis",
+							},
+						},
+					},
+				},
+			},
+			lang:          "java",
+			tracerVersion: "v1",
+			out: pb.ClientStatsPayload{
+				Hostname:      "tracer_hots",
+				Env:           "tracer_env",
+				Version:       "code_version",
+				Lang:          "java",
+				TracerVersion: "v1",
+				Stats: []pb.ClientStatsBucket{
+					{
+						Start:    1,
+						Duration: 2,
+						Stats: []pb.ClientGroupedStats{
+							{
+								Service:        "service",
+								Name:           "name",
+								Resource:       "resource",
+								HTTPStatusCode: 200,
+								Type:           "web",
+							},
+							{
+								Service:        "redis_service",
+								Name:           "name_2",
+								Resource:       "SET",
+								HTTPStatusCode: 200,
+								Type:           "redis",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	a := Agent{
+		Blacklister: filters.NewBlacklister([]string{"blocked_resource"}),
+		obfuscator:  obfuscate.NewObfuscator(nil),
+		Replacer:    filters.NewReplacer([]*config.ReplaceRule{{Name: "http.status_code", Pattern: "400", Re: regexp.MustCompile("400"), Repl: "200"}}),
+		conf:        &config.AgentConfig{DefaultEnv: "agent_env", Hostname: "agent_hostname"},
+	}
+	for _, testCase := range testCases {
+		out := a.processStats(testCase.in, testCase.lang, testCase.tracerVersion)
+		assert.Equal(t, testCase.out, out)
+	}
+}
+
+func TestMergeDuplicates(t *testing.T) {
+	in := pb.ClientStatsBucket{
+		Stats: []pb.ClientGroupedStats{
+			{
+				Service:      "s1",
+				Resource:     "r1",
+				Name:         "n1",
+				Hits:         2,
+				TopLevelHits: 2,
+				Errors:       1,
+				Duration:     123,
+			},
+			{
+				Service:      "s2",
+				Resource:     "r1",
+				Name:         "n1",
+				Hits:         2,
+				TopLevelHits: 2,
+				Errors:       0,
+				Duration:     123,
+			},
+			{
+				Service:      "s1",
+				Resource:     "r1",
+				Name:         "n1",
+				Hits:         2,
+				TopLevelHits: 2,
+				Errors:       1,
+				Duration:     123,
+			},
+			{
+				Service:      "s2",
+				Resource:     "r1",
+				Name:         "n1",
+				Hits:         2,
+				TopLevelHits: 2,
+				Errors:       0,
+				Duration:     123,
+			},
+		},
+	}
+	expected := pb.ClientStatsBucket{
+		Stats: []pb.ClientGroupedStats{
+			{
+				Service:      "s1",
+				Resource:     "r1",
+				Name:         "n1",
+				Hits:         4,
+				TopLevelHits: 2,
+				Errors:       2,
+				Duration:     246,
+			},
+			{
+				Service:      "s2",
+				Resource:     "r1",
+				Name:         "n1",
+				Hits:         4,
+				TopLevelHits: 2,
+				Errors:       0,
+				Duration:     246,
+			},
+			{
+				Service:      "s1",
+				Resource:     "r1",
+				Name:         "n1",
+				Hits:         0,
+				TopLevelHits: 2,
+				Errors:       0,
+				Duration:     0,
+			},
+			{
+				Service:      "s2",
+				Resource:     "r1",
+				Name:         "n1",
+				Hits:         0,
+				TopLevelHits: 2,
+				Errors:       0,
+				Duration:     0,
+			},
+		},
+	}
+	mergeDuplicates(in)
+	assert.Equal(t, expected, in)
 }

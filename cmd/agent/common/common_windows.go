@@ -1,27 +1,23 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2016-2019 Datadog, Inc.
+// Copyright 2016-present Datadog, Inc.
 
 package common
 
 import (
-	"fmt"
-	"io/ioutil"
-	"net/url"
 	"os"
-	"strconv"
-	"strings"
-
 	"path/filepath"
 
 	"github.com/DataDog/datadog-agent/pkg/config"
-
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 	"github.com/DataDog/datadog-agent/pkg/util/winutil"
+
+	// Init packages
+	_ "github.com/DataDog/datadog-agent/pkg/util/containers/providers/windows"
+
 	"github.com/cihub/seelog"
 	"golang.org/x/sys/windows/registry"
-	yaml "gopkg.in/yaml.v2"
 )
 
 var (
@@ -44,14 +40,20 @@ var (
 	DefaultLogFile = "c:\\programdata\\datadog\\logs\\agent.log"
 	// DefaultDCALogFile points to the log file that will be used if not configured
 	DefaultDCALogFile = "c:\\programdata\\datadog\\logs\\cluster-agent.log"
+	//DefaultJmxLogFile points to the jmx fetch log file that will be used if not configured
+	DefaultJmxLogFile = "c:\\programdata\\datadog\\logs\\jmxfetch.log"
+	// DefaultCheckFlareDirectory a flare friendly location for checks to be written
+	DefaultCheckFlareDirectory = "c:\\programdata\\datadog\\logs\\checks\\"
+	// DefaultJMXFlareDirectory a flare friendly location for jmx command logs to be written
+	DefaultJMXFlareDirectory = "c:\\programdata\\datadog\\logs\\jmxinfo\\"
 )
 
 func init() {
 	pd, err := winutil.GetProgramDataDir()
 	if err == nil {
-		DefaultConfPath = filepath.Join(pd, "Datadog")
-		DefaultLogFile = filepath.Join(pd, "Datadog", "logs", "agent.log")
-		DefaultDCALogFile = filepath.Join(pd, "Datadog", "logs", "cluster-agent.log")
+		DefaultConfPath = pd
+		DefaultLogFile = filepath.Join(pd, "logs", "agent.log")
+		DefaultDCALogFile = filepath.Join(pd, "logs", "cluster-agent.log")
 	} else {
 		winutil.LogEventViewer(config.ServiceName, 0x8000000F, DefaultConfPath)
 	}
@@ -111,7 +113,7 @@ func GetViewsPath() string {
 			return ""
 		}
 		viewsPath = filepath.Join(s, "bin", "agent", "dist", "views")
-		log.Debug("ViewsPath is now %s", viewsPath)
+		log.Debugf("ViewsPath is now %s", viewsPath)
 	}
 	return viewsPath
 }
@@ -125,7 +127,7 @@ func CheckAndUpgradeConfig() error {
 		return nil
 	}
 	config.Datadog.AddConfigPath(DefaultConfPath)
-	err := config.Load()
+	_, err := config.Load()
 	if err == nil {
 		// was able to read config, check for api key
 		if config.Datadog.GetString("api_key") != "" {
@@ -134,184 +136,4 @@ func CheckAndUpgradeConfig() error {
 		}
 	}
 	return ImportConfig(DefaultConfPath, DefaultConfPath, false)
-}
-
-// ImportRegistryConfig imports settings from Windows registry into datadog.yaml
-func ImportRegistryConfig() error {
-
-	k, err := registry.OpenKey(registry.LOCAL_MACHINE,
-		"SOFTWARE\\Datadog\\Datadog Agent",
-		registry.ALL_ACCESS)
-	if err != nil {
-		if err == registry.ErrNotExist {
-			log.Debug("Windows installation key not found, not updating config")
-			return nil
-		}
-		// otherwise, unexpected error
-		log.Warnf("Unexpected error getting registry config: %s", err)
-		return err
-	}
-	defer k.Close()
-
-	err = SetupConfig("")
-	if err != nil {
-		return fmt.Errorf("unable to set up global agent configuration: %v", err)
-	}
-
-	// store the current datadog.yaml path
-	datadogYamlPath := config.Datadog.ConfigFileUsed()
-
-	if config.Datadog.GetString("api_key") != "" {
-		return fmt.Errorf("%s seems to contain a valid configuration, not overwriting config",
-			datadogYamlPath)
-	}
-
-	overrides := make(map[string]interface{})
-
-	var val string
-
-	if val, _, err = k.GetStringValue("api_key"); err == nil {
-		overrides["api_key"] = val
-		log.Debug("Setting API key")
-	} else {
-		log.Debug("API key not found, not setting")
-	}
-	if val, _, err = k.GetStringValue("tags"); err == nil {
-		overrides["tags"] = strings.Split(val, ",")
-		log.Debugf("Setting tags %s", val)
-	} else {
-		log.Debug("Tags not found, not setting")
-	}
-	if val, _, err = k.GetStringValue("hostname"); err == nil {
-		overrides["hostname"] = val
-		log.Debugf("Setting hostname %s", val)
-	} else {
-		log.Debug("hostname not found in registry: using default value")
-	}
-	if val, _, err = k.GetStringValue("cmd_port"); err == nil && val != "" {
-		cmdPortInt, err := strconv.Atoi(val)
-		if err != nil {
-			log.Warnf("Not setting api port, invalid configuration %s %v", val, err)
-		} else if cmdPortInt <= 0 || cmdPortInt > 65534 {
-			log.Warnf("Not setting api port, invalid configuration %s", val)
-		} else {
-			overrides["cmd_port"] = cmdPortInt
-			log.Debugf("Setting cmd_port  %d", cmdPortInt)
-		}
-	} else {
-		log.Debug("cmd_port not found, not setting")
-	}
-	for key, cfg := range subServices {
-		if val, _, err = k.GetStringValue(key); err == nil {
-			val = strings.ToLower(val)
-			if enabled, ok := enabledVals[val]; ok {
-				// some of the entries require booleans, some
-				// of the entries require strings.
-				if enabled {
-					switch cfg {
-					case "logs_enabled":
-						overrides[cfg] = true
-					case "apm_config.enabled":
-						overrides[cfg] = true
-					case "process_config.enabled":
-						overrides[cfg] = "true"
-					}
-					log.Debugf("Setting %s to true", cfg)
-				} else {
-					switch cfg {
-					case "logs_enabled":
-						overrides[cfg] = false
-					case "apm_config.enabled":
-						overrides[cfg] = false
-					case "process_config.enabled":
-						overrides[cfg] = "disabled"
-					}
-					log.Debugf("Setting %s to false", cfg)
-				}
-			} else {
-				log.Warnf("Unknown setting %s = %s", key, val)
-			}
-		}
-	}
-	if val, _, err = k.GetStringValue("proxy_host"); err == nil && val != "" {
-		var u *url.URL
-		if u, err = url.Parse(val); err != nil {
-			log.Warnf("unable to import value of settings 'proxy_host': %v", err)
-		} else {
-			// set scheme if missing
-			if u.Scheme == "" {
-				u, _ = url.Parse("http://" + val)
-			}
-			if val, _, err = k.GetStringValue("proxy_port"); err == nil && val != "" {
-				u.Host = u.Host + ":" + val
-			}
-			if user, _, _ := k.GetStringValue("proxy_user"); err == nil && user != "" {
-				if pass, _, _ := k.GetStringValue("proxy_password"); err == nil && pass != "" {
-					u.User = url.UserPassword(user, pass)
-				} else {
-					u.User = url.User(user)
-				}
-			}
-		}
-		proxyMap := make(map[string]string)
-		proxyMap["http"] = u.String()
-		proxyMap["https"] = u.String()
-		overrides["proxy"] = proxyMap
-	} else {
-		log.Debug("proxy key not found, not setting proxy config")
-	}
-	if val, _, err = k.GetStringValue("site"); err == nil && val != "" {
-		overrides["site"] = val
-		log.Debugf("Setting site to %s", val)
-	}
-	if val, _, err = k.GetStringValue("dd_url"); err == nil && val != "" {
-		overrides["dd_url"] = val
-		log.Debugf("Setting dd_url to %s", val)
-	}
-	if val, _, err = k.GetStringValue("logs_dd_url"); err == nil && val != "" {
-		overrides["logs_dd_url"] = val
-		log.Debugf("Setting logs_config.dd_url to %s", val)
-	}
-	if val, _, err = k.GetStringValue("process_dd_url"); err == nil && val != "" {
-		overrides["process_config.process_dd_url"] = val
-		log.Debugf("Setting process_config.process_dd_url to %s", val)
-	}
-	if val, _, err = k.GetStringValue("trace_dd_url"); err == nil && val != "" {
-		overrides["apm_config.apm_dd_url"] = val
-		log.Debugf("Setting apm_config.apm_dd_url to %s", val)
-	}
-
-	// apply overrides to the config
-	config.SetOverrides(overrides)
-
-	// build the global agent configuration
-	err = SetupConfig("")
-	if err != nil {
-		return fmt.Errorf("unable to set up global agent configuration: %v", err)
-	}
-
-	// dump the current configuration to datadog.yaml
-	b, err := yaml.Marshal(config.Datadog.AllSettings())
-	if err != nil {
-		log.Errorf("unable to unmarshal config to YAML: %v", err)
-		return fmt.Errorf("unable to unmarshal config to YAML: %v", err)
-	}
-	// file permissions will be used only to create the file if doesn't exist,
-	// please note on Windows such permissions have no effect.
-	if err = ioutil.WriteFile(datadogYamlPath, b, 0640); err != nil {
-		log.Errorf("unable to unmarshal config to %s: %v", datadogYamlPath, err)
-		return fmt.Errorf("unable to unmarshal config to %s: %v", datadogYamlPath, err)
-	}
-
-	valuenames := []string{"api_key", "tags", "hostname",
-		"proxy_host", "proxy_port", "proxy_user", "proxy_password", "cmd_port"}
-	for _, valuename := range valuenames {
-		k.DeleteValue(valuename)
-	}
-	for valuename := range subServices {
-		k.DeleteValue(valuename)
-	}
-	log.Debugf("Successfully wrote the config into %s\n", datadogYamlPath)
-
-	return nil
 }

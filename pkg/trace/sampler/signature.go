@@ -1,10 +1,15 @@
+// Unless explicitly stated otherwise all files in this repository are licensed
+// under the Apache License Version 2.0.
+// This product includes software developed at Datadog (https://www.datadoghq.com/).
+// Copyright 2016-present Datadog, Inc.
+
 package sampler
 
 import (
-	"hash/fnv"
 	"sort"
 
 	"github.com/DataDog/datadog-agent/pkg/trace/pb"
+	"github.com/DataDog/datadog-agent/pkg/trace/traceutil"
 )
 
 // Signature is a hash representation of trace or a service, used to identify
@@ -25,13 +30,12 @@ func sortHashes(hashes []spanHash)         { sort.Sort(spanHashSlice(hashes)) }
 // Signature based on the hash of (env, service, name, resource, is_error) for the root, plus the set of
 // (env, service, name, is_error) of each span.
 func computeSignatureWithRootAndEnv(trace pb.Trace, root *pb.Span, env string) Signature {
-	rootHash := computeRootHash(*root, env)
+	rootHash := computeSpanHash(root, env, true)
 	spanHashes := make([]spanHash, 0, len(trace))
 
 	for i := range trace {
-		spanHashes = append(spanHashes, computeSpanHash(trace[i], env))
+		spanHashes = append(spanHashes, computeSpanHash(trace[i], env, false))
 	}
-
 	// Now sort, dedupe then merge all the hashes to build the signature
 	sortHashes(spanHashes)
 
@@ -55,9 +59,9 @@ type ServiceSignature struct{ Name, Env string }
 // priority, and used as a key to store the desired rate for a given
 // service,env tuple.
 func (s ServiceSignature) Hash() Signature {
-	h := fnv.New32a()
+	h := new32a()
 	h.Write([]byte(s.Name))
-	h.Write([]byte{','})
+	h.WriteChar(',')
 	h.Write([]byte(s.Env))
 	return Signature(h.Sum32())
 }
@@ -66,23 +70,53 @@ func (s ServiceSignature) String() string {
 	return "service:" + s.Name + ",env:" + s.Env
 }
 
-func computeSpanHash(span *pb.Span, env string) spanHash {
-	h := fnv.New32a()
+func computeSpanHash(span *pb.Span, env string, withResource bool) spanHash {
+	h := new32a()
 	h.Write([]byte(env))
 	h.Write([]byte(span.Service))
 	h.Write([]byte(span.Name))
-	h.Write([]byte{byte(span.Error)})
-
+	h.WriteChar(byte(span.Error))
+	if withResource {
+		h.Write([]byte(span.Resource))
+	}
+	code, ok := traceutil.GetMeta(span, KeyHTTPStatusCode)
+	if ok {
+		h.Write([]byte(code))
+	}
+	typ, ok := traceutil.GetMeta(span, KeyErrorType)
+	if ok {
+		h.Write([]byte(typ))
+	}
 	return spanHash(h.Sum32())
 }
 
-func computeRootHash(span pb.Span, env string) spanHash {
-	h := fnv.New32a()
-	h.Write([]byte(env))
-	h.Write([]byte(span.Service))
-	h.Write([]byte(span.Name))
-	h.Write([]byte(span.Resource))
-	h.Write([]byte{byte(span.Error)})
+// sum32a is an adaptation of https://golang.org/pkg/hash/fnv/#New32a, but simplified
+// for our use case to remove interfaces which caused unnecessary allocations.
+type sum32a uint32
 
-	return spanHash(h.Sum32())
+const (
+	offset32 = 2166136261
+	prime32  = 16777619
+)
+
+func new32a() sum32a {
+	return offset32
 }
+
+func (s *sum32a) Write(data []byte) {
+	hash := *s
+	for _, c := range data {
+		hash ^= sum32a(c)
+		hash *= prime32
+	}
+	*s = hash
+}
+
+func (s *sum32a) WriteChar(c byte) {
+	hash := *s
+	hash ^= sum32a(c)
+	hash *= prime32
+	*s = hash
+}
+
+func (s *sum32a) Sum32() uint32 { return uint32(*s) }

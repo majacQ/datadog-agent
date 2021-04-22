@@ -1,7 +1,7 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2016-2019 Datadog, Inc.
+// Copyright 2016-present Datadog, Inc.
 
 // +build kubelet
 
@@ -9,6 +9,7 @@ package kubelet
 
 import (
 	"encoding/json"
+	"fmt"
 	"io/ioutil"
 	"testing"
 
@@ -48,5 +49,64 @@ func loadPodsFixture(path string) ([]*Pod, error) {
 	if err != nil {
 		return nil, err
 	}
+	for _, pod := range podList.Items {
+		allContainers := make([]ContainerStatus, 0, len(pod.Status.InitContainers)+len(pod.Status.Containers))
+		allContainers = append(allContainers, pod.Status.InitContainers...)
+		allContainers = append(allContainers, pod.Status.Containers...)
+		pod.Status.AllContainers = allContainers
+	}
 	return podList.Items, nil
+}
+
+func TestKubeContainerIDToTaggerEntityID(t *testing.T) {
+	for in, out := range map[string]string{
+		"container_id://deadbeef": "container_id://deadbeef",
+		"containerd://deadbeef":   "container_id://deadbeef",
+		"cri-o://deadbeef":        "container_id://deadbeef",
+		"cri-o://d":               "container_id://d",
+		"runtime://deadbeef":      "container_id://deadbeef",
+		"container_id://":         "",
+		"deadbeef":                "",
+		"/deadbeef":               "",
+		"runtime://foo/bar":       "container_id://foo/bar",
+	} {
+		t.Run(fmt.Sprintf("case: %s", in), func(t *testing.T) {
+			res, _ := KubeContainerIDToTaggerEntityID(in)
+			assert.Equal(t, out, res)
+		})
+	}
+}
+
+func TestKubePodUIDToTaggerEntityID(t *testing.T) {
+	for in, out := range map[string]string{
+		"kubernetes_pod_uid://deadbeef": "kubernetes_pod_uid://deadbeef",
+		"pod://deadbeef":                "kubernetes_pod_uid://deadbeef",
+		"kubernetes_pod://deadbeef":     "kubernetes_pod_uid://deadbeef",
+		"kubernetes_pod://d":            "kubernetes_pod_uid://d",
+		"kubernetes_pod_uid://":         "",
+		"deadbeef":                      "",
+		"/deadbeef":                     "",
+	} {
+		t.Run(fmt.Sprintf("case: %s", in), func(t *testing.T) {
+			res, _ := KubePodUIDToTaggerEntityID(in)
+			assert.Equal(t, out, res)
+		})
+	}
+}
+
+func TestKubeIDToTaggerEntityID(t *testing.T) {
+	for in, out := range map[string]string{
+		"kubernetes_pod://deadbeef": "kubernetes_pod_uid://deadbeef",
+		"kubernetes_pod://d":        "kubernetes_pod_uid://d",
+		"docker://deadbeef":         "container_id://deadbeef",
+		"crio://deadbeef":           "container_id://deadbeef",
+		"kubernetes_pod://":         "",
+		"deadbeef":                  "",
+		"/deadbeef":                 "",
+	} {
+		t.Run(fmt.Sprintf("case: %s", in), func(t *testing.T) {
+			res, _ := KubeIDToTaggerEntityID(in)
+			assert.Equal(t, out, res)
+		})
+	}
 }

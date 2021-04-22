@@ -1,12 +1,14 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2016-2019 Datadog, Inc.
+// Copyright 2016-present Datadog, Inc.
 
 package config
 
 import (
+	"os"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/suite"
 
@@ -39,18 +41,21 @@ func (suite *ConfigTestSuite) TestDefaultDatadogConfig() {
 	suite.Equal(30, suite.config.GetInt("logs_config.stop_grace_period"))
 	suite.Equal(nil, suite.config.Get("logs_config.processing_rules"))
 	suite.Equal("", suite.config.GetString("logs_config.processing_rules"))
+	suite.Equal(false, suite.config.GetBool("logs_config.use_http"))
+	suite.Equal(false, suite.config.GetBool("logs_config.k8s_container_use_file"))
 }
 
 func (suite *ConfigTestSuite) TestDefaultSources() {
-	var sources []*LogSource
-	var source *LogSource
+	// container collect all source
+
+	source := ContainerCollectAllSource()
+	suite.Nil(source)
 
 	suite.config.Set("logs_config.container_collect_all", true)
 
-	sources = DefaultSources()
-	suite.Equal(1, len(sources))
+	source = ContainerCollectAllSource()
+	suite.NotNil(source)
 
-	source = sources[0]
 	suite.Equal("container_collect_all", source.Name)
 	suite.Equal(DockerType, source.Config.Type)
 	suite.Equal("docker", source.Config.Source)
@@ -123,6 +128,241 @@ func (suite *ConfigTestSuite) TestGlobalProcessingRulesShouldReturnRulesWithVali
 	suite.NotNil(rule.Regex)
 }
 
+func (suite *ConfigTestSuite) TestTaggerWarmupDuration() {
+	// assert TaggerWarmupDuration is disabled by default
+	taggerWarmupDuration := TaggerWarmupDuration()
+	suite.Equal(0*time.Second, taggerWarmupDuration)
+
+	// override
+	suite.config.Set("logs_config.tagger_warmup_duration", 5)
+	taggerWarmupDuration = TaggerWarmupDuration()
+	suite.Equal(5*time.Second, taggerWarmupDuration)
+}
+
 func TestConfigTestSuite(t *testing.T) {
 	suite.Run(t, new(ConfigTestSuite))
+}
+
+func (suite *ConfigTestSuite) TestMultipleHttpEndpointsEnvVar() {
+	suite.config.Set("api_key", "123")
+	suite.config.Set("logs_config.batch_wait", 1)
+	suite.config.Set("logs_config.logs_dd_url", "agent-http-intake.logs.datadoghq.com:443")
+	suite.config.Set("logs_config.use_compression", true)
+	suite.config.Set("logs_config.compression_level", 6)
+	suite.config.Set("logs_config.logs_no_ssl", false)
+
+	os.Setenv("DD_LOGS_CONFIG_ADDITIONAL_ENDPOINTS", `[
+	{"api_key": "456", "host": "additional.endpoint.1", "port": 1234, "use_compression": true, "compression_level": 2},
+	{"api_key": "789", "host": "additional.endpoint.2", "port": 1234, "use_compression": true, "compression_level": 2}]`)
+	defer os.Unsetenv("DD_LOGS_CONFIG_ADDITIONAL_ENDPOINTS")
+
+	expectedMainEndpoint := Endpoint{
+		APIKey:           "123",
+		Host:             "agent-http-intake.logs.datadoghq.com",
+		Port:             443,
+		UseSSL:           true,
+		UseCompression:   true,
+		CompressionLevel: 6}
+	expectedAdditionalEndpoint1 := Endpoint{
+		APIKey:           "456",
+		Host:             "additional.endpoint.1",
+		Port:             1234,
+		UseSSL:           true,
+		UseCompression:   true,
+		CompressionLevel: 2}
+	expectedAdditionalEndpoint2 := Endpoint{
+		APIKey:           "789",
+		Host:             "additional.endpoint.2",
+		Port:             1234,
+		UseSSL:           true,
+		UseCompression:   true,
+		CompressionLevel: 2}
+
+	expectedEndpoints := NewEndpoints(expectedMainEndpoint, []Endpoint{expectedAdditionalEndpoint1, expectedAdditionalEndpoint2}, false, true, time.Second, 0)
+	endpoints, err := BuildHTTPEndpoints()
+
+	suite.Nil(err)
+	suite.Equal(expectedEndpoints, endpoints)
+}
+
+func (suite *ConfigTestSuite) TestMultipleTCPEndpointsEnvVar() {
+	suite.config.Set("api_key", "123")
+	suite.config.Set("logs_config.logs_dd_url", "agent-http-intake.logs.datadoghq.com:443")
+	suite.config.Set("logs_config.logs_no_ssl", false)
+	suite.config.Set("logs_config.socks5_proxy_address", "proxy.test:3128")
+	suite.config.Set("logs_config.dev_mode_use_proto", true)
+
+	os.Setenv("DD_LOGS_CONFIG_ADDITIONAL_ENDPOINTS", `[{"api_key": "456      \n", "host": "additional.endpoint", "port": 1234}]`)
+	defer os.Unsetenv("DD_LOGS_CONFIG_ADDITIONAL_ENDPOINTS")
+
+	expectedMainEndpoint := Endpoint{
+		APIKey:           "123",
+		Host:             "agent-http-intake.logs.datadoghq.com",
+		Port:             443,
+		UseSSL:           true,
+		UseCompression:   false,
+		CompressionLevel: 0,
+		ProxyAddress:     "proxy.test:3128"}
+	expectedAdditionalEndpoint := Endpoint{
+		APIKey:           "456",
+		Host:             "additional.endpoint",
+		Port:             1234,
+		UseSSL:           true,
+		UseCompression:   false,
+		CompressionLevel: 0,
+		ProxyAddress:     "proxy.test:3128"}
+
+	expectedEndpoints := NewEndpoints(expectedMainEndpoint, []Endpoint{expectedAdditionalEndpoint}, true, false, 0, 0)
+	endpoints, err := buildTCPEndpoints()
+
+	suite.Nil(err)
+	suite.Equal(expectedEndpoints, endpoints)
+}
+
+func (suite *ConfigTestSuite) TestMultipleHttpEndpointsInConfig() {
+	suite.config.Set("api_key", "123")
+	suite.config.Set("logs_config.batch_wait", 1)
+	suite.config.Set("logs_config.logs_dd_url", "agent-http-intake.logs.datadoghq.com:443")
+	suite.config.Set("logs_config.use_compression", true)
+	suite.config.Set("logs_config.compression_level", 6)
+	suite.config.Set("logs_config.logs_no_ssl", false)
+	endpointsInConfig := []map[string]interface{}{
+		{
+			"api_key":           "456     \n\n",
+			"host":              "additional.endpoint.1",
+			"port":              1234,
+			"use_compression":   true,
+			"compression_level": 2},
+		{
+			"api_key":           "789",
+			"host":              "additional.endpoint.2",
+			"port":              1234,
+			"use_compression":   true,
+			"compression_level": 2},
+	}
+	suite.config.Set("logs_config.additional_endpoints", endpointsInConfig)
+
+	expectedMainEndpoint := Endpoint{
+		APIKey:           "123",
+		Host:             "agent-http-intake.logs.datadoghq.com",
+		Port:             443,
+		UseSSL:           true,
+		UseCompression:   true,
+		CompressionLevel: 6}
+	expectedAdditionalEndpoint1 := Endpoint{
+		APIKey:           "456",
+		Host:             "additional.endpoint.1",
+		Port:             1234,
+		UseSSL:           true,
+		UseCompression:   true,
+		CompressionLevel: 2}
+	expectedAdditionalEndpoint2 := Endpoint{
+		APIKey:           "789",
+		Host:             "additional.endpoint.2",
+		Port:             1234,
+		UseSSL:           true,
+		UseCompression:   true,
+		CompressionLevel: 2}
+
+	expectedEndpoints := NewEndpoints(expectedMainEndpoint, []Endpoint{expectedAdditionalEndpoint1, expectedAdditionalEndpoint2}, false, true, time.Second, 0)
+	endpoints, err := BuildHTTPEndpoints()
+
+	suite.Nil(err)
+	suite.Equal(expectedEndpoints, endpoints)
+}
+
+func (suite *ConfigTestSuite) TestMultipleTCPEndpointsInConf() {
+	suite.config.Set("api_key", "123")
+	suite.config.Set("logs_config.logs_dd_url", "agent-http-intake.logs.datadoghq.com:443")
+	suite.config.Set("logs_config.logs_no_ssl", false)
+	suite.config.Set("logs_config.socks5_proxy_address", "proxy.test:3128")
+	suite.config.Set("logs_config.dev_mode_use_proto", true)
+	suite.config.Set("logs_config.dev_mode_use_proto", true)
+	endpointsInConfig := []map[string]interface{}{
+		{
+			"api_key": "456",
+			"host":    "additional.endpoint",
+			"port":    1234},
+	}
+	suite.config.Set("logs_config.additional_endpoints", endpointsInConfig)
+
+	expectedMainEndpoint := Endpoint{
+		APIKey:           "123",
+		Host:             "agent-http-intake.logs.datadoghq.com",
+		Port:             443,
+		UseSSL:           true,
+		UseCompression:   false,
+		CompressionLevel: 0,
+		ProxyAddress:     "proxy.test:3128"}
+	expectedAdditionalEndpoint := Endpoint{
+		APIKey:           "456",
+		Host:             "additional.endpoint",
+		Port:             1234,
+		UseSSL:           true,
+		UseCompression:   false,
+		CompressionLevel: 0,
+		ProxyAddress:     "proxy.test:3128"}
+
+	expectedEndpoints := NewEndpoints(expectedMainEndpoint, []Endpoint{expectedAdditionalEndpoint}, true, false, 0, 0)
+	endpoints, err := buildTCPEndpoints()
+
+	suite.Nil(err)
+	suite.Equal(expectedEndpoints, endpoints)
+}
+
+func (suite *ConfigTestSuite) TestEndpointsSetLogsDDUrl() {
+	suite.config.Set("api_key", "123")
+	suite.config.Set("compliance_config.endpoints.logs_dd_url", "my-proxy:443")
+
+	logsConfig := NewLogsConfigKeys("compliance_config.endpoints.")
+	endpoints, err := BuildHTTPEndpointsWithConfig(logsConfig, "default-intake.mydomain.")
+
+	suite.Nil(err)
+
+	expectedEndpoints := &Endpoints{
+		UseHTTP:   true,
+		BatchWait: coreConfig.DefaultBatchWait * time.Second,
+		Main: Endpoint{
+			APIKey:           "123",
+			Host:             "my-proxy",
+			Port:             443,
+			UseSSL:           true,
+			UseCompression:   true,
+			CompressionLevel: 6,
+		},
+	}
+
+	suite.Nil(err)
+	suite.Equal(expectedEndpoints, endpoints)
+}
+
+func (suite *ConfigTestSuite) TestEndpointsSetDDSite() {
+	suite.config.Set("api_key", "123")
+
+	os.Setenv("DD_SITE", "mydomain.com")
+	defer os.Unsetenv("DD_SITE")
+
+	os.Setenv("DD_COMPLIANCE_CONFIG_ENDPOINTS_BATCH_WAIT", "10")
+	defer os.Unsetenv("DD_COMPLIANCE_CONFIG_ENDPOINTS_BATCH_WAIT")
+
+	logsConfig := NewLogsConfigKeys("compliance_config.endpoints.")
+	endpoints, err := BuildHTTPEndpointsWithConfig(logsConfig, "default-intake.logs.")
+
+	suite.Nil(err)
+
+	expectedEndpoints := &Endpoints{
+		UseHTTP:   true,
+		BatchWait: 10 * time.Second,
+		Main: Endpoint{
+			APIKey:           "123",
+			Host:             "default-intake.logs.mydomain.com",
+			Port:             0,
+			UseSSL:           true,
+			UseCompression:   true,
+			CompressionLevel: 6,
+		},
+	}
+
+	suite.Nil(err)
+	suite.Equal(expectedEndpoints, endpoints)
 }

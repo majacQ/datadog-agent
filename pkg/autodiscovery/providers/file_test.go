@@ -1,14 +1,17 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2016-2019 Datadog, Inc.
+// Copyright 2016-present Datadog, Inc.
 
 package providers
 
 import (
+	"os"
 	"testing"
 
 	"github.com/DataDog/datadog-agent/pkg/autodiscovery/integration"
+	"github.com/DataDog/datadog-agent/pkg/config"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -42,6 +45,7 @@ func TestGetIntegrationConfig(t *testing.T) {
 	require.Nil(t, err)
 	assert.Equal(t, config.Name, "foo")
 	assert.Equal(t, []byte(config.InitConfig), []byte("- test: 21\n"))
+	assert.Equal(t, config.Source, "file:tests/testcheck.yaml")
 	assert.Equal(t, len(config.Instances), 1)
 	assert.Equal(t, []byte(config.Instances[0]), []byte("foo: bar\n"))
 	assert.Len(t, config.ADIdentifiers, 0)
@@ -70,6 +74,7 @@ func TestNewYamlConfigProvider(t *testing.T) {
 }
 
 func TestCollect(t *testing.T) {
+	config.Datadog.Set("ignore_autoconf", []string{"ignored"})
 	paths := []string{"tests", "foo/bar"}
 	provider := NewFileConfigProvider(paths)
 	configs, err := provider.Collect()
@@ -119,9 +124,42 @@ func TestCollect(t *testing.T) {
 	// logs files collected in root directory
 	assert.Equal(t, 1, len(get("logs-agent_only")))
 
+	// ignored autoconf file not collected
+	assert.Equal(t, 0, len(get("ignored")))
+
 	// total number of configurations found
-	assert.Equal(t, 14, len(configs))
+	assert.Equal(t, 15, len(configs))
 
 	// incorrect configs get saved in the Errors map (invalid.yaml & notaconfig.yaml & ad_deprecated.yaml)
 	assert.Equal(t, 3, len(provider.Errors))
+}
+
+func TestEnvVarReplacement(t *testing.T) {
+	err := os.Setenv("test_envvar_key", "test_value")
+	require.NoError(t, err)
+	os.Unsetenv("test_envvar_not_set")
+	defer os.Unsetenv("test_envvar_key")
+
+	paths := []string{"tests"}
+	provider := NewFileConfigProvider(paths)
+	configs, err := provider.Collect()
+
+	assert.Nil(t, err)
+
+	get := func(name string) []integration.Config {
+		out := []integration.Config{}
+		for _, c := range configs {
+			if c.Name == name {
+				out = append(out, c)
+			}
+		}
+		return out
+	}
+
+	rc := get("envvars")
+	assert.Len(t, rc, 1)
+	assert.Contains(t, string(rc[0].InitConfig), "test_value")
+	assert.Contains(t, string(rc[0].Instances[0]), "test_value")
+	assert.Len(t, rc[0].Instances, 2)
+	assert.Contains(t, string(rc[0].Instances[1]), "test_envvar_not_set")
 }

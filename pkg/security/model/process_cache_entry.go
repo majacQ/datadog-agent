@@ -1,0 +1,80 @@
+// Unless explicitly stated otherwise all files in this repository are licensed
+// under the Apache License Version 2.0.
+// This product includes software developed at Datadog (https://www.datadoghq.com/).
+// Copyright 2016-present Datadog, Inc.
+
+// +build linux
+
+package model
+
+import (
+	"time"
+)
+
+// Exit a process
+func (pc *ProcessCacheEntry) Exit(exitTime time.Time) {
+	pc.ExitTime = exitTime
+}
+
+func copyProcessContext(parent, child *ProcessCacheEntry) {
+	// inherit the container ID from the parent if necessary. If a container is already running when system-probe
+	// starts, the in-kernel process cache will have out of sync container ID values for the processes of that
+	// container (the snapshot doesn't update the in-kernel cache with the container IDs). This can also happen if
+	// the proc_cache LRU ejects an entry.
+	// WARNING: this is why the user space cache should not be used to detect container breakouts. Dedicated
+	// in-kernel probes will need to be added.
+	if len(parent.ContainerID) > 0 && len(child.ContainerID) == 0 {
+		child.ContainerID = parent.ContainerID
+		child.ContainerPath = parent.ContainerPath
+	}
+}
+
+func (pc *ProcessCacheEntry) compactArgsEnvs() {
+	// TODO: do not copy for the moment, need to handle memory usage properly
+	pc.ArgsArray = []string{}
+	pc.EnvsArray = []string{}
+}
+
+// Exec replace a process
+func (pc *ProcessCacheEntry) Exec(entry *ProcessCacheEntry) {
+	entry.Ancestor = pc
+
+	pc.compactArgsEnvs()
+
+	// empty and mark as exit previous entry
+	pc.ExitTime = entry.ExecTime
+
+	// keep some context
+	copyProcessContext(pc, entry)
+}
+
+// Fork returns a copy of the current ProcessCacheEntry
+func (pc *ProcessCacheEntry) Fork(childEntry *ProcessCacheEntry) {
+	childEntry.PPid = pc.Pid
+	childEntry.Ancestor = pc
+	childEntry.TTYName = pc.TTYName
+	childEntry.Comm = pc.Comm
+	childEntry.FileFields = pc.FileFields
+	childEntry.PathnameStr = pc.PathnameStr
+	childEntry.BasenameStr = pc.BasenameStr
+	childEntry.Filesystem = pc.Filesystem
+	childEntry.ContainerPath = pc.ContainerPath
+	childEntry.ExecTimestamp = pc.ExecTimestamp
+	childEntry.Credentials = pc.Credentials
+	childEntry.Cookie = pc.Cookie
+
+	copyProcessContext(pc, childEntry)
+}
+
+/*func (pc *ProcessCacheEntry) String() string {
+	s := fmt.Sprintf("filename: %s[%s] pid:%d ppid:%d args:%v\n", pc.PathnameStr, pc.Comm, pc.Pid, pc.PPid, pc.ArgsArray)
+	ancestor := pc.Ancestor
+	for i := 0; ancestor != nil; i++ {
+		for j := 0; j <= i; j++ {
+			s += "\t"
+		}
+		s += fmt.Sprintf("filename: %s[%s] pid:%d ppid:%d args:%v\n", ancestor.PathnameStr, ancestor.Comm, ancestor.Pid, ancestor.PPid, ancestor.ArgsArray)
+		ancestor = ancestor.Ancestor
+	}
+	return s
+}*/

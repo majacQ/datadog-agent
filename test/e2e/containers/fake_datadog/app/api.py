@@ -1,14 +1,13 @@
 import logging
 import os
 import sys
-import ujson as json
 import zlib
 from os import path
 
-import pymongo
-from flask import Flask, request, Response, jsonify
-
 import monitoring
+import pymongo
+import ujson as json
+from flask import Flask, Response, jsonify, request
 
 app = application = Flask("datadoghq")
 monitoring.monitor_flask(app)
@@ -20,7 +19,7 @@ record_dir = path.join(path.dirname(path.dirname(path.abspath(__file__))), "reco
 
 
 def get_collection(name: str):
-    c = pymongo.MongoClient("192.168.254.241", 27017, connectTimeoutMS=5000)
+    c = pymongo.MongoClient("127.0.0.1", 27017, connectTimeoutMS=5000)
     db = c.get_database("datadog")
     return db.get_collection(name)
 
@@ -29,6 +28,7 @@ payload_names = [
     "check_run",
     "series",
     "intake",
+    "logs",
 ]
 
 
@@ -69,6 +69,29 @@ def record_and_loads(filename: str, content_type: str, content_encoding: str, co
     return json.loads(content)
 
 
+def patch_data(data, patch_key, patch_leaf):
+    if isinstance(data, dict):
+        return {patch_key(k): patch_data(v, patch_key, patch_leaf) for k, v in iter(data.items())}
+    elif isinstance(data, list):
+        return [patch_data(i, patch_key, patch_leaf) for i in data]
+    else:
+        return patch_leaf(data)
+
+
+def fix_data(data):
+    return patch_data(
+        data,
+        # Whereas dot (.) and dollar ($) are valid characters inside a JSON dict key,
+        # they are not allowed as keys in a MongoDB BSON object.
+        # The official MongoDB documentation suggests to replace them with their
+        # unicode full width equivalent:
+        # https://docs.mongodb.com/v2.6/faq/developers/#dollar-sign-operator-escaping
+        patch_key=lambda x: x.translate(str.maketrans('.$', '\uff0e\uff04')),
+        # Values that cannot fit in a 64 bits integer must be represented as a float.
+        patch_leaf=lambda x: float(x) if isinstance(x, int) and x > 2 ** 63 - 1 else x,
+    )
+
+
 def insert_series(data: dict):
     coll = get_collection("series")
     coll.insert_many(data["series"])
@@ -76,11 +99,16 @@ def insert_series(data: dict):
 
 def insert_intake(data: dict):
     coll = get_collection("intake")
-    coll.insert(data)
+    coll.insert_one(data)
 
 
 def insert_check_run(data: list):
     coll = get_collection("check_run")
+    coll.insert_many(data)
+
+
+def insert_logs(data: list):
+    coll = get_collection("logs")
     coll.insert_many(data)
 
 
@@ -93,13 +121,13 @@ def get_series_from_query(q: dict):
     from_ts, to_ts = int(q["from"]), int(q["to"])
 
     # tags
-    all_tags = query[first_open_brace + 1:first_close_brace]
+    all_tags = query[first_open_brace + 1 : first_close_brace]
     all_tags = all_tags.split(",") if all_tags else []
 
     # group by
     # TODO
     last_open_brace, last_close_brace = query.rindex("{"), query.rindex("}")
-    group_by = query[last_open_brace + 1:last_close_brace].split(",")
+    group_by = query[last_open_brace + 1 : last_close_brace].split(",")  # noqa: F841
 
     match_conditions = [
         {"metric": metric_name},
@@ -112,7 +140,8 @@ def get_series_from_query(q: dict):
     c = get_collection("series")
     aggregate = [
         {"$match": {"$and": match_conditions}},
-        {"$unwind": "$points"}, {"$group": {"_id": "$metric", "points": {"$push": "$points"}}},
+        {"$unwind": "$points"},
+        {"$group": {"_id": "$metric", "points": {"$push": "$points"}}},
         {"$sort": {"points.0": 1}},
     ]
     app.logger.info("Mongodb aggregate is %s", aggregate)
@@ -120,6 +149,7 @@ def get_series_from_query(q: dict):
     points_list = []
     for elt in cur:
         for p in elt["points"]:
+            p[0] *= 1000
             points_list.append(p)
 
     result = {
@@ -132,22 +162,20 @@ def get_series_from_query(q: dict):
                 "display_name": metric_name,
                 "unit": None,
                 "pointlist": points_list,
-                "end": points_list[-1][0] if points_list else 0.,
+                "end": points_list[-1][0] if points_list else 0.0,
                 "interval": 600,
-                "start": points_list[0][0] if points_list else 0.,
+                "start": points_list[0][0] if points_list else 0.0,
                 "length": len(points_list),
                 "aggr": None,
-                "scope": "host:vagrant-ubuntu-trusty-64", # TODO
+                "scope": "host:vagrant-ubuntu-trusty-64",  # TODO
                 "expression": query,
             }
         ],
         "from_date": from_ts,
-        "group_by": [
-            "host"
-        ],
+        "group_by": ["host"],
         "to_date": to_ts,
         "query": q["query"],
-        "message": ""
+        "message": "",
     }
     return result
 
@@ -176,8 +204,9 @@ def series():
         filename="series",
         content_type=request.content_type,
         content_encoding=request.content_encoding,
-        content=request.data
+        content=request.data,
     )
+    data = fix_data(data)
     insert_series(data)
     return Response(status=200)
 
@@ -188,8 +217,9 @@ def check_run():
         filename="check_run",
         content_type=request.content_type,
         content_encoding=request.content_encoding,
-        content=request.data
+        content=request.data,
     )
+    data = fix_data(data)
     insert_check_run(data)
     return Response(status=200)
 
@@ -200,17 +230,47 @@ def intake():
         filename="intake",
         content_type=request.content_type,
         content_encoding=request.content_encoding,
-        content=request.data
+        content=request.data,
     )
+    data = fix_data(data)
     insert_intake(data)
+    return Response(status=200)
+
+
+@app.route("/v1/input/", methods=["POST"])
+def logs():
+    data = record_and_loads(
+        filename="logs",
+        content_type=request.content_type,
+        content_encoding=request.content_encoding,
+        content=request.data,
+    )
+    data = fix_data(data)
+    insert_logs(data)
+    return Response(status=200)
+
+
+@app.route("/api/v1/orchestrator", methods=["POST"])
+def orchestrator():
+    # TODO
     return Response(status=200)
 
 
 @app.before_request
 def logging():
+    # use only if you need to check headers
+    # mind where the logs of this container go since headers contain an API key
+    # app.logger.info(
+    #     "path: %s, method: %s, content-type: %s, content-encoding: %s, content-length: %s, headers: %s",
+    #     request.path, request.method, request.content_type, request.content_encoding, request.content_length, request.headers)
     app.logger.info(
         "path: %s, method: %s, content-type: %s, content-encoding: %s, content-length: %s",
-        request.path, request.method, request.content_type, request.content_encoding, request.content_length)
+        request.path,
+        request.method,
+        request.content_type,
+        request.content_encoding,
+        request.content_length,
+    )
 
 
 def stat_records():

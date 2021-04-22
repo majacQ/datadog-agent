@@ -1,20 +1,23 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2016-2019 Datadog, Inc.
+// Copyright 2016-present Datadog, Inc.
 
 // +build kubeapiserver
 
 package apiserver
 
 import (
+	"context"
 	"testing"
 	"time"
 
+	apiv1 "github.com/DataDog/datadog-agent/pkg/clusteragent/api/v1"
+	"github.com/DataDog/datadog-agent/pkg/util/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -79,7 +82,7 @@ func TestMetadataControllerSyncEndpoints(t *testing.T) {
 		desc            string
 		delete          bool // whether to add or delete endpoints
 		endpoints       *v1.Endpoints
-		expectedBundles map[string]ServicesMapper
+		expectedBundles map[string]apiv1.NamespacesPodsStringsSet
 	}{
 		{
 			"one service on multiple nodes",
@@ -95,7 +98,7 @@ func TestMetadataControllerSyncEndpoints(t *testing.T) {
 					},
 				},
 			},
-			map[string]ServicesMapper{
+			map[string]apiv1.NamespacesPodsStringsSet{
 				"node1": {
 					"default": {
 						"pod1_name": sets.NewString("svc1"),
@@ -123,7 +126,7 @@ func TestMetadataControllerSyncEndpoints(t *testing.T) {
 					},
 				},
 			},
-			map[string]ServicesMapper{
+			map[string]apiv1.NamespacesPodsStringsSet{
 				"node1": {
 					"default": {
 						"pod1_name": sets.NewString("svc1"),
@@ -151,7 +154,7 @@ func TestMetadataControllerSyncEndpoints(t *testing.T) {
 					},
 				},
 			},
-			map[string]ServicesMapper{
+			map[string]apiv1.NamespacesPodsStringsSet{
 				"node1": {
 					"default": {
 						"pod1_name": sets.NewString("svc1"),
@@ -177,7 +180,7 @@ func TestMetadataControllerSyncEndpoints(t *testing.T) {
 					},
 				},
 			},
-			map[string]ServicesMapper{
+			map[string]apiv1.NamespacesPodsStringsSet{
 				"node1": {
 					"default": {
 						"pod1_name": sets.NewString("svc1", "svc2"),
@@ -196,7 +199,7 @@ func TestMetadataControllerSyncEndpoints(t *testing.T) {
 			&v1.Endpoints{
 				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "svc1"},
 			},
-			map[string]ServicesMapper{
+			map[string]apiv1.NamespacesPodsStringsSet{
 				"node1": {
 					"default": {
 						"pod1_name": sets.NewString("svc2"),
@@ -216,7 +219,7 @@ func TestMetadataControllerSyncEndpoints(t *testing.T) {
 					},
 				},
 			},
-			map[string]ServicesMapper{ // no changes to cluster metadata
+			map[string]apiv1.NamespacesPodsStringsSet{ // no changes to cluster metadata
 				"node1": {
 					"default": {
 						"pod1_name": sets.NewString("svc2"),
@@ -236,7 +239,7 @@ func TestMetadataControllerSyncEndpoints(t *testing.T) {
 					},
 				},
 			},
-			map[string]ServicesMapper{ // no changes to cluster metadata
+			map[string]apiv1.NamespacesPodsStringsSet{ // no changes to cluster metadata
 				"node1": {
 					"default": {
 						"pod1_name": sets.NewString("svc2"),
@@ -250,7 +253,7 @@ func TestMetadataControllerSyncEndpoints(t *testing.T) {
 			&v1.Endpoints{
 				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "svc2"},
 			},
-			map[string]ServicesMapper{},
+			map[string]apiv1.NamespacesPodsStringsSet{},
 		},
 	}
 
@@ -327,7 +330,7 @@ func TestMetadataController(t *testing.T) {
 		},
 	}
 	node.Name = "ip-172-31-119-125"
-	_, err := c.Nodes().Create(node)
+	_, err := c.Nodes().Create(context.TODO(), node, metav1.CreateOptions{})
 	require.NoError(t, err)
 
 	pod := &v1.Pod{
@@ -346,7 +349,7 @@ func TestMetadataController(t *testing.T) {
 	}
 	pod.Name = "nginx"
 	pod.Labels = map[string]string{"app": "nginx"}
-	pendingPod, err := c.Pods("default").Create(pod)
+	pendingPod, err := c.Pods("default").Create(context.TODO(), pod, metav1.CreateOptions{})
 	require.NoError(t, err)
 
 	pendingPod.Status = v1.PodStatus{
@@ -369,7 +372,7 @@ func TestMetadataController(t *testing.T) {
 			},
 		},
 	}
-	_, err = c.Pods("default").UpdateStatus(pendingPod)
+	_, err = c.Pods("default").UpdateStatus(context.TODO(), pendingPod, metav1.UpdateOptions{})
 	require.NoError(t, err)
 
 	svc := &v1.Service{
@@ -381,7 +384,7 @@ func TestMetadataController(t *testing.T) {
 		},
 	}
 	svc.Name = "nginx-1"
-	_, err = c.Services("default").Create(svc)
+	_, err = c.Services("default").Create(context.TODO(), svc, metav1.CreateOptions{})
 	require.NoError(t, err)
 
 	ep := &v1.Endpoints{
@@ -410,16 +413,16 @@ func TestMetadataController(t *testing.T) {
 		},
 	}
 	ep.Name = "nginx-1"
-	_, err = c.Endpoints("default").Create(ep)
+	_, err = c.Endpoints("default").Create(context.TODO(), ep, metav1.CreateOptions{})
 	require.NoError(t, err)
 
 	// Add a new service/endpoint on the nginx Pod
 	svc.Name = "nginx-2"
-	_, err = c.Services("default").Create(svc)
+	_, err = c.Services("default").Create(context.TODO(), svc, metav1.CreateOptions{})
 	require.NoError(t, err)
 
 	ep.Name = "nginx-2"
-	_, err = c.Endpoints("default").Create(ep)
+	_, err = c.Endpoints("default").Create(context.TODO(), ep, metav1.CreateOptions{})
 	require.NoError(t, err)
 
 	metaController, informerFactory := newFakeMetadataController(client)
@@ -429,26 +432,42 @@ func TestMetadataController(t *testing.T) {
 	informerFactory.Start(stop)
 	go metaController.Run(stop)
 
-	for !metaController.endpointsListerSynced() && !metaController.nodeListerSynced() {
-		time.Sleep(150 * time.Millisecond)
-	}
+	testutil.AssertTrueBeforeTimeout(t, 100*time.Millisecond, 500*time.Millisecond, func() bool {
+		if !metaController.endpointsListerSynced() && !metaController.nodeListerSynced() {
+			return false
+		}
+		return true
+	})
 
-	metadataNames, err := GetPodMetadataNames(node.Name, pod.Namespace, pod.Name)
-	require.NoError(t, err)
-	assert.Len(t, metadataNames, 2)
-	assert.Contains(t, metadataNames, "kube_service:nginx-1")
-	assert.Contains(t, metadataNames, "kube_service:nginx-2")
+	testutil.AssertTrueBeforeTimeout(t, 100*time.Millisecond, 500*time.Millisecond, func() bool {
+		metadataNames, err := GetPodMetadataNames(node.Name, pod.Namespace, pod.Name)
+		if err != nil {
+			return false
+		}
+		if len(metadataNames) != 2 {
+			return false
+		}
+		assert.Contains(t, metadataNames, "kube_service:nginx-1")
+		assert.Contains(t, metadataNames, "kube_service:nginx-2")
+		return true
+	})
 
 	cl := &APIClient{Cl: client, timeoutSeconds: 5}
 
-	fullmapper, errList := GetMetadataMapBundleOnAllNodes(cl)
-	require.Nil(t, errList)
-	list := fullmapper["Nodes"]
-	assert.Contains(t, list, "ip-172-31-119-125")
-	fullMap := list.(map[string]*MetadataMapperBundle)
-	services, found := fullMap["ip-172-31-119-125"].ServicesForPod(metav1.NamespaceDefault, "nginx")
-	assert.True(t, found)
-	assert.Contains(t, services, "nginx-1")
+	testutil.AssertTrueBeforeTimeout(t, 100*time.Millisecond, 500*time.Millisecond, func() bool {
+		fullmapper, errList := GetMetadataMapBundleOnAllNodes(cl)
+		require.Nil(t, errList)
+		list := fullmapper.Nodes
+		assert.Contains(t, list, "ip-172-31-119-125")
+		bundle := metadataMapperBundle{Services: list["ip-172-31-119-125"].Services}
+		services, found := bundle.ServicesForPod(metav1.NamespaceDefault, "nginx")
+		if !found {
+			return false
+		}
+		assert.Contains(t, services, "nginx-1")
+		return true
+	})
+
 }
 
 func newFakeMetadataController(client kubernetes.Interface) (*MetadataController, informers.SharedInformerFactory) {
@@ -456,20 +475,11 @@ func newFakeMetadataController(client kubernetes.Interface) (*MetadataController
 
 	metaController := NewMetadataController(
 		informerFactory.Core().V1().Nodes(),
+		informerFactory.Core().V1().Namespaces(),
 		informerFactory.Core().V1().Endpoints(),
 	)
 
 	return metaController, informerFactory
-}
-
-func requireReceive(t *testing.T, ch chan struct{}, msgAndArgs ...interface{}) {
-	timeout := time.NewTimer(2 * time.Second)
-
-	select {
-	case <-ch:
-	case <-timeout.C:
-		require.FailNow(t, "Timeout waiting to receive from channel", msgAndArgs...)
-	}
 }
 
 func newFakePod(namespace, name, uid, ip string) v1.Pod {

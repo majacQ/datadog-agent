@@ -1,7 +1,7 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2016-2019 Datadog, Inc.
+// Copyright 2016-present Datadog, Inc.
 
 // Package agent implements the api endpoints for the `/agent` prefix.
 // This group of endpoints is meant to provide high-level functionalities
@@ -11,8 +11,11 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
+	"net"
 	"net/http"
 	"sort"
+	"time"
 
 	"github.com/gorilla/mux"
 
@@ -22,9 +25,11 @@ import (
 	"github.com/DataDog/datadog-agent/cmd/agent/gui"
 	"github.com/DataDog/datadog-agent/pkg/autodiscovery"
 	"github.com/DataDog/datadog-agent/pkg/autodiscovery/integration"
-	"github.com/DataDog/datadog-agent/pkg/collector/py"
 	"github.com/DataDog/datadog-agent/pkg/config"
+	settingshttp "github.com/DataDog/datadog-agent/pkg/config/settings/http"
 	"github.com/DataDog/datadog-agent/pkg/flare"
+	"github.com/DataDog/datadog-agent/pkg/logs"
+	"github.com/DataDog/datadog-agent/pkg/logs/diagnostic"
 	"github.com/DataDog/datadog-agent/pkg/secrets"
 	"github.com/DataDog/datadog-agent/pkg/status"
 	"github.com/DataDog/datadog-agent/pkg/status/health"
@@ -32,17 +37,24 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/tagger/collectors"
 	"github.com/DataDog/datadog-agent/pkg/util"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
-	"github.com/DataDog/datadog-agent/pkg/version"
-	yaml "gopkg.in/yaml.v2"
 )
 
+type contextKey struct {
+	key string
+}
+
+// ConnContextKey key to reference the http connection from the request context
+var ConnContextKey = &contextKey{"http-connection"}
+
 // SetupHandlers adds the specific handlers for /agent endpoints
-func SetupHandlers(r *mux.Router) {
-	r.HandleFunc("/version", getVersion).Methods("GET")
+func SetupHandlers(r *mux.Router) *mux.Router {
+	r.HandleFunc("/version", common.GetVersion).Methods("GET")
 	r.HandleFunc("/hostname", getHostname).Methods("GET")
 	r.HandleFunc("/flare", makeFlare).Methods("POST")
 	r.HandleFunc("/stop", stopAgent).Methods("POST")
 	r.HandleFunc("/status", getStatus).Methods("GET")
+	r.HandleFunc("/stream-logs", streamLogs).Methods("POST")
+	r.HandleFunc("/dogstatsd-stats", getDogstatsdStats).Methods("GET")
 	r.HandleFunc("/status/formatted", getFormattedStatus).Methods("GET")
 	r.HandleFunc("/status/health", getHealth).Methods("GET")
 	r.HandleFunc("/{component}/status", componentStatusGetterHandler).Methods("GET")
@@ -50,22 +62,20 @@ func SetupHandlers(r *mux.Router) {
 	r.HandleFunc("/{component}/configs", componentConfigHandler).Methods("GET")
 	r.HandleFunc("/gui/csrf-token", getCSRFToken).Methods("GET")
 	r.HandleFunc("/config-check", getConfigCheck).Methods("GET")
-	r.HandleFunc("/config", getRuntimeConfig).Methods("GET")
+	r.HandleFunc("/config", settingshttp.Server.GetFull("")).Methods("GET")
+	r.HandleFunc("/config/list-runtime", settingshttp.Server.ListConfigurable).Methods("GET")
+	r.HandleFunc("/config/{setting}", settingshttp.Server.GetValue).Methods("GET")
+	r.HandleFunc("/config/{setting}", settingshttp.Server.SetValue).Methods("POST")
 	r.HandleFunc("/tagger-list", getTaggerList).Methods("GET")
 	r.HandleFunc("/secrets", secretInfo).Methods("GET")
+
+	return r
 }
 
 func stopAgent(w http.ResponseWriter, r *http.Request) {
 	signals.Stopper <- true
 	w.Header().Set("Content-Type", "application/json")
 	j, _ := json.Marshal("")
-	w.Write(j)
-}
-
-func getVersion(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	av, _ := version.New(version.AgentVersion, version.Commit)
-	j, _ := json.Marshal(av)
 	w.Write(j)
 }
 
@@ -80,26 +90,32 @@ func getHostname(w http.ResponseWriter, r *http.Request) {
 	w.Write(j)
 }
 
-func getPythonStatus(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	pyStats, err := py.GetPythonInterpreterMemoryUsage()
-	if err != nil {
-		log.Warnf("Error getting python stats: %s\n", err) // or something like this
-		http.Error(w, err.Error(), 500)
+func makeFlare(w http.ResponseWriter, r *http.Request) {
+	var profile flare.ProfileData
+
+	if r.Body != http.NoBody {
+		body, err := ioutil.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, log.Errorf("Error while reading HTTP request body: %s", err).Error(), 500)
+			return
+		}
+
+		if err := json.Unmarshal(body, &profile); err != nil {
+			http.Error(w, log.Errorf("Error while unmarshaling JSON from request body: %s", err).Error(), 500)
+			return
+		}
 	}
 
-	j, _ := json.Marshal(pyStats)
-	w.Write(j)
-}
-
-func makeFlare(w http.ResponseWriter, r *http.Request) {
 	logFile := config.Datadog.GetString("log_file")
 	if logFile == "" {
 		logFile = common.DefaultLogFile
 	}
-
+	jmxLogFile := config.Datadog.GetString("jmx_log_file")
+	if jmxLogFile == "" {
+		jmxLogFile = common.DefaultJmxLogFile
+	}
 	log.Infof("Making a flare")
-	filePath, err := flare.CreateArchive(false, common.GetDistPath(), common.PyChecksPath, logFile)
+	filePath, err := flare.CreateArchive(false, common.GetDistPath(), common.PyChecksPath, []string{logFile, jmxLogFile}, profile)
 	if err != nil || filePath == "" {
 		if err != nil {
 			log.Errorf("The flare failed to be created: %s", err)
@@ -172,6 +188,117 @@ func getStatus(w http.ResponseWriter, r *http.Request) {
 	w.Write(jsonStats)
 }
 
+func streamLogs(w http.ResponseWriter, r *http.Request) {
+	log.Info("Got a request for stream logs.")
+	w.Header().Set("Transfer-Encoding", "chunked")
+
+	logMessageReceiver := logs.GetMessageReceiver()
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		log.Errorf("Expected a Flusher type, got: %v", w)
+		return
+	}
+
+	if logMessageReceiver == nil {
+		http.Error(w, "The logs agent is not running", 405)
+		flusher.Flush()
+		log.Info("Logs agent is not running - can't stream logs")
+		return
+	}
+
+	if !logMessageReceiver.SetEnabled(true) {
+		http.Error(w, "Another client is already streaming logs.", 405)
+		flusher.Flush()
+		log.Info("Logs are already streaming. Dropping connection.")
+		return
+	}
+	defer logMessageReceiver.SetEnabled(false)
+
+	var filters diagnostic.Filters
+
+	if r.Body != http.NoBody {
+		body, err := ioutil.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, log.Errorf("Error while reading HTTP request body: %s", err).Error(), 500)
+			return
+		}
+
+		if err := json.Unmarshal(body, &filters); err != nil {
+			http.Error(w, log.Errorf("Error while unmarshaling JSON from request body: %s", err).Error(), 500)
+			return
+		}
+	}
+
+	conn := GetConnection(r)
+
+	// Override the default server timeouts so the connection never times out
+	_ = conn.SetDeadline(time.Time{})
+	_ = conn.SetWriteDeadline(time.Time{})
+
+	for {
+		// Handlers for detecting a closed connection (from either the server or client)
+		select {
+		case <-w.(http.CloseNotifier).CloseNotify():
+			return
+		case <-r.Context().Done():
+			return
+		default:
+		}
+		if line, ok := logMessageReceiver.Next(&filters); ok {
+			fmt.Fprint(w, line)
+		} else {
+			// The buffer will flush on its own most of the time, but when we run out of logs flush so the client is up to date.
+			flusher.Flush()
+		}
+	}
+}
+
+func getDogstatsdStats(w http.ResponseWriter, r *http.Request) {
+	log.Info("Got a request for the Dogstatsd stats.")
+
+	if !config.Datadog.GetBool("use_dogstatsd") {
+		w.Header().Set("Content-Type", "application/json")
+		body, _ := json.Marshal(map[string]string{
+			"error":      "Dogstatsd not enabled in the Agent configuration",
+			"error_type": "no server",
+		})
+		w.WriteHeader(400)
+		w.Write(body)
+		return
+	}
+
+	if !config.Datadog.GetBool("dogstatsd_metrics_stats_enable") {
+		w.Header().Set("Content-Type", "application/json")
+		body, _ := json.Marshal(map[string]string{
+			"error":      "Dogstatsd metrics stats not enabled in the Agent configuration",
+			"error_type": "not enabled",
+		})
+		w.WriteHeader(400)
+		w.Write(body)
+		return
+	}
+
+	// Weird state that should not happen: dogstatsd is enabled
+	// but the server has not been successfully initialized.
+	// Return no data.
+	if common.DSD == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{}`))
+		return
+	}
+
+	jsonStats, err := common.DSD.GetJSONDebugStats()
+	if err != nil {
+		log.Errorf("Error getting marshalled Dogstatsd stats: %s", err)
+		body, _ := json.Marshal(map[string]string{"error": err.Error()})
+		http.Error(w, string(body), 500)
+		return
+	}
+
+	w.Write(jsonStats)
+}
+
 func getFormattedStatus(w http.ResponseWriter, r *http.Request) {
 	log.Info("Got a request for the formatted status. Making formatted status.")
 	s, err := status.GetAndFormatStatus()
@@ -187,7 +314,7 @@ func getFormattedStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func getHealth(w http.ResponseWriter, r *http.Request) {
-	h := health.GetStatus()
+	h := health.GetReady()
 
 	if len(h.Unhealthy) > 0 {
 		log.Debugf("Healthcheck failed on: %v", h.Unhealthy)
@@ -211,6 +338,13 @@ func getCSRFToken(w http.ResponseWriter, r *http.Request) {
 func getConfigCheck(w http.ResponseWriter, r *http.Request) {
 	var response response.ConfigCheckResponse
 
+	if common.AC == nil {
+		log.Errorf("Trying to use /config-check before the agent has been initialized.")
+		body, _ := json.Marshal(map[string]string{"error": "agent not initialized"})
+		http.Error(w, string(body), 503)
+		return
+	}
+
 	configs := common.AC.GetLoadedConfigs()
 	configSlice := make([]integration.Config, 0)
 	for _, config := range configs {
@@ -233,17 +367,6 @@ func getConfigCheck(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Write(jsonConfig)
-}
-
-func getRuntimeConfig(w http.ResponseWriter, r *http.Request) {
-	runtimeConfig, err := yaml.Marshal(config.Datadog.AllSettings())
-	if err != nil {
-		log.Errorf("Unable to marshal runtime config response: %s", err)
-		body, _ := json.Marshal(map[string]string{"error": err.Error()})
-		http.Error(w, string(body), 500)
-		return
-	}
-	w.Write(runtimeConfig)
 }
 
 func getTaggerList(w http.ResponseWriter, r *http.Request) {
@@ -285,4 +408,9 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// GetConnection returns the connection for the request
+func GetConnection(r *http.Request) net.Conn {
+	return r.Context().Value(ConnContextKey).(net.Conn)
 }

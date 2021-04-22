@@ -1,7 +1,7 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2016-2019 Datadog, Inc.
+// Copyright 2016-present Datadog, Inc.
 
 package metrics
 
@@ -11,8 +11,9 @@ import (
 	"errors"
 	"expvar"
 	"fmt"
+	"sort"
+	"strconv"
 	"strings"
-	"unsafe"
 
 	agentpayload "github.com/DataDog/agent-payload/gogen"
 	"github.com/gogo/protobuf/proto"
@@ -20,19 +21,14 @@ import (
 
 	"github.com/DataDog/datadog-agent/pkg/aggregator/ckey"
 	"github.com/DataDog/datadog-agent/pkg/serializer/marshaler"
+	"github.com/DataDog/datadog-agent/pkg/telemetry"
 )
 
-var seriesExpvar = expvar.NewMap("series")
-
-var marshaller = jsoniter.Config{
-	EscapeHTML:                    false,
-	ObjectFieldMustBeSimpleString: true,
-}.Froze()
-
 var (
-	jsonSeparator  = []byte(",")
-	jsonArrayStart = []byte("[")
-	jsonArrayEnd   = []byte("]")
+	seriesExpvar = expvar.NewMap("series")
+
+	tlmSeries = telemetry.NewCounter("metrics", "series_split",
+		[]string{"action"}, "Series split")
 )
 
 // Point represents a metric value at a specific time
@@ -99,6 +95,44 @@ func (series Series) Marshal() ([]byte, error) {
 	return proto.Marshal(payload)
 }
 
+// MarshalStrings converts the timeseries to a sorted slice of string slices
+func (series Series) MarshalStrings() ([]string, [][]string) {
+	var headers = []string{"Metric", "Type", "Timestamp", "Value", "Tags"}
+	var payload = make([][]string, len(series))
+
+	for _, serie := range series {
+		payload = append(payload, []string{
+			serie.Name,
+			serie.MType.String(),
+			strconv.FormatFloat(serie.Points[0].Ts, 'f', 0, 64),
+			strconv.FormatFloat(serie.Points[0].Value, 'f', -1, 64),
+			strings.Join(serie.Tags, ", "),
+		})
+	}
+
+	sort.Slice(payload, func(i, j int) bool {
+		// edge cases
+		if len(payload[i]) == 0 && len(payload[j]) == 0 {
+			return false
+		}
+		if len(payload[i]) == 0 || len(payload[j]) == 0 {
+			return len(payload[i]) == 0
+		}
+		// sort by metric name
+		if payload[i][0] != payload[j][0] {
+			return payload[i][0] < payload[j][0]
+		}
+		// then by timestamp
+		if payload[i][2] != payload[j][2] {
+			return payload[i][2] < payload[j][2]
+		}
+		// finally by tags (last field) as tie breaker
+		return payload[i][len(payload[i])-1] < payload[j][len(payload[j])-1]
+	})
+
+	return headers, payload
+}
+
 // populateDeviceField removes any `device:` tag in the series tags and uses the value to
 // populate the Serie.Device field
 //FIXME(olivier): remove this as soon as the v1 API can handle `device` as a regular tag
@@ -118,6 +152,7 @@ func populateDeviceField(serie *Serie) {
 			filteredTags = append(filteredTags, tag)
 		}
 	}
+
 	serie.Tags = filteredTags
 }
 
@@ -151,6 +186,7 @@ func (series Series) MarshalJSON() ([]byte, error) {
 // SplitPayload breaks the payload into, at least, "times" number of pieces
 func (series Series) SplitPayload(times int) ([]marshaler.Marshaler, error) {
 	seriesExpvar.Add("TimesSplit", 1)
+	tlmSeries.Inc("times_split")
 
 	// We need to split series without splitting metrics across multiple
 	// payload. So we first group series by metric name.
@@ -166,6 +202,7 @@ func (series Series) SplitPayload(times int) ([]marshaler.Marshaler, error) {
 	// if we only have one metric name we cannot split further
 	if len(metricsPerName) == 1 {
 		seriesExpvar.Add("SplitMetricsTooBig", 1)
+		tlmSeries.Inc("split_metrics_too_big")
 		return nil, fmt.Errorf("Cannot split metric '%s' into %d payload (it contains %d series)", series[0].Name, times, len(series))
 	}
 
@@ -199,6 +236,11 @@ func (series Series) SplitPayload(times int) ([]marshaler.Marshaler, error) {
 	return payloads, nil
 }
 
+// MarshalSplitCompress not implemented
+func (series Series) MarshalSplitCompress(bufferContext *marshaler.BufferContext) ([]*[]byte, error) {
+	return nil, fmt.Errorf("Series MarshalSplitCompress is not implemented")
+}
+
 // UnmarshalJSON is a custom unmarshaller for Point (used for testing)
 func (p *Point) UnmarshalJSON(buf []byte) error {
 	tmp := []interface{}{&p.Ts, &p.Value}
@@ -224,28 +266,35 @@ func (e Serie) String() string {
 //// The following methods implement the StreamJSONMarshaler interface
 //// for support of the enable_stream_payload_serialization option.
 
-// JSONHeader prints the payload header for this type
-func (series Series) JSONHeader() []byte {
-	return []byte(`{"series":[`)
+// WriteHeader writes the payload header for this type
+func (series Series) WriteHeader(stream *jsoniter.Stream) error {
+	stream.WriteObjectStart()
+	stream.WriteObjectField("series")
+	stream.WriteArrayStart()
+	return stream.Flush()
+}
+
+// WriteFooter prints the payload footer for this type
+func (series Series) WriteFooter(stream *jsoniter.Stream) error {
+	stream.WriteArrayEnd()
+	stream.WriteObjectEnd()
+	return stream.Flush()
+}
+
+// WriteItem prints the json representation of an item
+func (series Series) WriteItem(stream *jsoniter.Stream, i int) error {
+	if i < 0 || i > len(series)-1 {
+		return errors.New("out of range")
+	}
+	serie := series[i]
+	populateDeviceField(serie)
+	encodeSerie(serie, stream)
+	return stream.Flush()
 }
 
 // Len returns the number of items to marshal
 func (series Series) Len() int {
 	return len(series)
-}
-
-// JSONItem prints the json representation of an item
-func (series Series) JSONItem(i int) ([]byte, error) {
-	if i < 0 || i > len(series)-1 {
-		return nil, errors.New("out of range")
-	}
-	populateDeviceField(series[i])
-	return marshaller.Marshal(series[i])
-}
-
-// JSONFooter prints the payload footer for this type
-func (series Series) JSONFooter() []byte {
-	return []byte(`]}`)
 }
 
 // DescribeItem returns a text description for logs
@@ -256,34 +305,71 @@ func (series Series) DescribeItem(i int) string {
 	return fmt.Sprintf("name %q, %d points", series[i].Name, len(series[i].Points))
 }
 
-// encodePoints is registered to serialize a Point array with
-// limited reflections and heap allocations.
-// Called when using jsoniter
-func encodePoints(ptr unsafe.Pointer, stream *jsoniter.Stream) {
-	if ptr == nil {
-		stream.Write(jsonArrayStart)
-		stream.Write(jsonArrayEnd)
-		return
+func encodeSerie(serie *Serie, stream *jsoniter.Stream) {
+	stream.WriteObjectStart()
+
+	stream.WriteObjectField("metric")
+	stream.WriteString(serie.Name)
+	stream.WriteMore()
+
+	stream.WriteObjectField("points")
+	encodePoints(serie.Points, stream)
+	stream.WriteMore()
+
+	stream.WriteObjectField("tags")
+	stream.WriteArrayStart()
+	firstTag := true
+	for _, s := range serie.Tags {
+		if !firstTag {
+			stream.WriteMore()
+		}
+		stream.WriteString(s)
+		firstTag = false
+	}
+	stream.WriteArrayEnd()
+	stream.WriteMore()
+
+	stream.WriteObjectField("host")
+	stream.WriteString(serie.Host)
+	stream.WriteMore()
+
+	if serie.Device != "" {
+		stream.WriteObjectField("device")
+		stream.WriteString(serie.Device)
+		stream.WriteMore()
 	}
 
-	points := *(*[]Point)(ptr)
+	stream.WriteObjectField("type")
+	stream.WriteString(serie.MType.String())
+	stream.WriteMore()
+
+	stream.WriteObjectField("interval")
+	stream.WriteInt64(serie.Interval)
+
+	if serie.SourceTypeName != "" {
+		stream.WriteMore()
+		stream.WriteObjectField("source_type_name")
+		stream.WriteString(serie.SourceTypeName)
+	}
+
+	stream.WriteObjectEnd()
+}
+
+func encodePoints(points []Point, stream *jsoniter.Stream) {
 	var needComa bool
-	stream.Write(jsonArrayStart)
+
+	stream.WriteArrayStart()
 	for _, p := range points {
 		if needComa {
-			stream.Write(jsonSeparator)
+			stream.WriteMore()
 		} else {
 			needComa = true
 		}
-		fmt.Fprintf(stream, "[%v,%v]", int64(p.Ts), p.Value)
+		stream.WriteArrayStart()
+		stream.WriteInt64(int64(p.Ts))
+		stream.WriteMore()
+		stream.WriteFloat64(p.Value)
+		stream.WriteArrayEnd()
 	}
-	stream.Write(jsonArrayEnd)
-}
-
-func init() {
-	jsoniter.RegisterTypeEncoderFunc(
-		"[]metrics.Point",
-		encodePoints,
-		func(ptr unsafe.Pointer) bool { return ptr == nil },
-	)
+	stream.WriteArrayEnd()
 }

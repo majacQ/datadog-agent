@@ -1,7 +1,7 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2016-2019 Datadog, Inc.
+// Copyright 2016-present Datadog, Inc.
 
 // +build jmx
 
@@ -13,24 +13,29 @@ import (
 
 	"github.com/DataDog/datadog-agent/pkg/autodiscovery/integration"
 	"github.com/DataDog/datadog-agent/pkg/collector/check"
+	telemetry_utils "github.com/DataDog/datadog-agent/pkg/telemetry/utils"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
 type JMXCheck struct {
-	id     check.ID
-	name   string
-	config integration.Config
-	stop   chan struct{}
+	id        check.ID
+	name      string
+	config    integration.Config
+	stop      chan struct{}
+	source    string
+	telemetry bool
 }
 
-func newJMXCheck(config integration.Config) *JMXCheck {
+func newJMXCheck(config integration.Config, source string) *JMXCheck {
 	check := &JMXCheck{
-		config: config,
-		stop:   make(chan struct{}),
-		name:   config.Name,
-		id:     check.ID(fmt.Sprintf("%v_%v", config.Name, config.Digest())),
+		config:    config,
+		stop:      make(chan struct{}),
+		name:      config.Name,
+		id:        check.ID(fmt.Sprintf("%v_%v", config.Name, config.Digest())),
+		source:    source,
+		telemetry: telemetry_utils.IsCheckEnabled("jmx"),
 	}
-	check.Configure(config.InitConfig, config.MetricConfig)
+	check.Configure(config.InitConfig, config.MetricConfig, source) //nolint:errcheck
 
 	return check
 }
@@ -56,6 +61,8 @@ func (c *JMXCheck) Stop() {
 	state.unscheduleCheck(c)
 }
 
+func (c *JMXCheck) Cancel() {}
+
 func (c *JMXCheck) String() string {
 	return c.name
 }
@@ -64,7 +71,11 @@ func (c *JMXCheck) Version() string {
 	return ""
 }
 
-func (c *JMXCheck) Configure(config integration.Data, initConfig integration.Data) error {
+func (c *JMXCheck) ConfigSource() string {
+	return c.source
+}
+
+func (c *JMXCheck) Configure(config integration.Data, initConfig integration.Data, source string) error {
 	return nil
 }
 
@@ -76,10 +87,14 @@ func (c *JMXCheck) ID() check.ID {
 	return c.id
 }
 
+func (c *JMXCheck) IsTelemetryEnabled() bool {
+	return c.telemetry
+}
+
 func (c *JMXCheck) GetWarnings() []error {
 	return []error{}
 }
 
-func (c *JMXCheck) GetMetricStats() (map[string]int64, error) {
-	return make(map[string]int64), nil
+func (c *JMXCheck) GetSenderStats() (check.SenderStats, error) {
+	return check.NewSenderStats(), nil
 }

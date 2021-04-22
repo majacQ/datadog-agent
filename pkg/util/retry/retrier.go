@@ -1,7 +1,7 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2016-2019 Datadog, Inc.
+// Copyright 2016-present Datadog, Inc.
 
 package retry
 
@@ -17,10 +17,11 @@ import (
 // See the unit test for an example.
 type Retrier struct {
 	sync.RWMutex
-	cfg      Config
-	status   Status
-	nextTry  time.Time
-	tryCount int
+	cfg          Config
+	status       Status
+	nextTry      time.Time
+	tryCount     uint
+	lastTryError error
 }
 
 // SetupRetrier must be called before calling other methods
@@ -37,6 +38,13 @@ func (r *Retrier) SetupRetrier(cfg *Config) error {
 		if cfg.RetryDelay.Nanoseconds() == 0 {
 			return errors.New("RetryCount strategy needs a non-zero RetryDelay")
 		}
+	case Backoff:
+		if cfg.InitialRetryDelay == 0 {
+			return errors.New("Backoff strategy needs a non-zero InitialRetryDelay")
+		}
+		if cfg.MaxRetryDelay == 0 {
+			return errors.New("Backoff strategy needs a non-zero MaxRetryDelay")
+		}
 	}
 
 	r.Lock()
@@ -45,6 +53,10 @@ func (r *Retrier) SetupRetrier(cfg *Config) error {
 		r.status = OK
 	} else {
 		r.status = Idle
+	}
+
+	if r.cfg.now == nil {
+		r.cfg.now = time.Now
 	}
 	r.Unlock()
 
@@ -87,7 +99,7 @@ func (r *Retrier) TriggerRetry() *Error {
 
 func (r *Retrier) doTry() *Error {
 	r.RLock()
-	if !r.nextTry.IsZero() && time.Now().Before(r.nextTry) {
+	if !r.nextTry.IsZero() && r.cfg.now().Before(r.nextTry) {
 		r.RUnlock()
 		return r.errorf("try delay not elapsed yet")
 	}
@@ -96,6 +108,7 @@ func (r *Retrier) doTry() *Error {
 	err := method()
 
 	r.Lock()
+	r.lastTryError = err
 	if err == nil {
 		r.status = OK
 	} else {
@@ -108,8 +121,17 @@ func (r *Retrier) doTry() *Error {
 				r.status = PermaFail
 			} else {
 				r.status = FailWillRetry
-				r.nextTry = time.Now().Add(r.cfg.RetryDelay - 100*time.Millisecond)
+				r.nextTry = r.cfg.now().Add(r.cfg.RetryDelay - 100*time.Millisecond)
 			}
+		case Backoff:
+			sleep := r.cfg.InitialRetryDelay * 1 << r.tryCount
+			if sleep > r.cfg.MaxRetryDelay {
+				sleep = r.cfg.MaxRetryDelay
+			} else {
+				r.tryCount++
+			}
+			r.status = FailWillRetry
+			r.nextTry = r.cfg.now().Add(sleep)
 		}
 	}
 	r.Unlock()
@@ -133,5 +155,6 @@ func (r *Retrier) wrapError(err error) *Error {
 		RessourceName: r.cfg.Name,
 		RetryStatus:   r.status,
 		LogicError:    err,
+		LastTryError:  r.lastTryError,
 	}
 }

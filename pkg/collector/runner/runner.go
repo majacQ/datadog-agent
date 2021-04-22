@@ -1,7 +1,7 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2016-2019 Datadog, Inc.
+// Copyright 2016-present Datadog, Inc.
 
 package runner
 
@@ -17,7 +17,6 @@ import (
 
 	"github.com/DataDog/datadog-agent/pkg/aggregator"
 	"github.com/DataDog/datadog-agent/pkg/collector/check"
-	"github.com/DataDog/datadog-agent/pkg/collector/py"
 	"github.com/DataDog/datadog-agent/pkg/collector/scheduler"
 	"github.com/DataDog/datadog-agent/pkg/config"
 	"github.com/DataDog/datadog-agent/pkg/metrics"
@@ -36,15 +35,20 @@ const (
 
 var (
 	// TestWg is used for testing the number of check workers
-	TestWg            sync.WaitGroup
-	defaultNumWorkers = 4
-	maxNumWorkers     = 25
-	runnerStats       *expvar.Map
-	checkStats        *runnerCheckStats
+	TestWg             sync.WaitGroup
+	runnerStats        *expvar.Map
+	runningChecksStats *expvar.Map
+	checkStats         *runnerCheckStats
 )
+
+type timeVar time.Time
+
+func (tv timeVar) String() string { return fmt.Sprintf("\"%s\"", time.Time(tv).Format(time.RFC3339)) }
 
 func init() {
 	runnerStats = expvar.NewMap("runner")
+	runningChecksStats = &expvar.Map{}
+	runnerStats.Set("running", runningChecksStats)
 	runnerStats.Set("Checks", expvar.Func(expCheckStats))
 	checkStats = &runnerCheckStats{
 		Stats: make(map[string]map[check.ID]*check.Stats),
@@ -59,21 +63,21 @@ type runnerCheckStats struct {
 
 // Runner ...
 type Runner struct {
+	// keep members that are used in atomic functions at the top of the structure
+	// important for 32 bit compiles.
+	// see https://github.com/golang/go/issues/599#issuecomment-419909701 for more information
+	running          uint32                   // Flag to see if the Runner is, well, running
+	staticNumWorkers bool                     // Flag indicating if numWorkers is dynamically updated
 	pending          chan check.Check         // The channel where checks come from
 	runningChecks    map[check.ID]check.Check // The list of checks running
 	scheduler        *scheduler.Scheduler     // Scheduler runner operates on
 	m                sync.Mutex               // To control races on runningChecks
-	running          uint32                   // Flag to see if the Runner is, well, running
-	staticNumWorkers bool                     // Flag indicating if numWorkers is dynamically updated
+
 }
 
 // NewRunner takes the number of desired goroutines processing incoming checks.
 func NewRunner() *Runner {
 	numWorkers := config.Datadog.GetInt("check_runners")
-	if numWorkers > maxNumWorkers {
-		numWorkers = maxNumWorkers
-		log.Warnf("Configured number of checks workers (%v) is too high: %v will be used", numWorkers, maxNumWorkers)
-	}
 
 	r := &Runner{
 		// initialize the channel
@@ -84,7 +88,7 @@ func NewRunner() *Runner {
 	}
 
 	if !r.staticNumWorkers {
-		numWorkers = defaultNumWorkers
+		numWorkers = config.DefaultNumWorkers
 	}
 
 	// start the workers
@@ -123,7 +127,7 @@ func (r *Runner) UpdateNumWorkers(numChecks int64) {
 	case numChecks <= 25:
 		desiredNumWorkers = 20
 	default:
-		desiredNumWorkers = maxNumWorkers
+		desiredNumWorkers = config.MaxNumWorkers
 	}
 
 	// Add workers if we don't have enough for this range
@@ -160,7 +164,7 @@ func (r *Runner) Stop() {
 	wg := sync.WaitGroup{}
 
 	// stop all python subprocesses
-	py.TerminateRunningProcesses()
+	terminateChecksRunningProcesses()
 
 	// stop running checks
 	for _, c := range r.runningChecks {
@@ -261,16 +265,18 @@ func (r *Runner) work() {
 		doLog, lastLog := shouldLog(check.ID())
 
 		if doLog {
-			log.Infof("Running check %s", check)
+			log.Infoc("Running check", "check", check)
 		} else {
-			log.Debugf("Running check %s", check)
+			log.Debugc("Running check", "check", check)
 		}
 
 		// run the check
 		var err error
 		t0 := time.Now()
 
+		runningChecksStats.Set(string(check.ID()), timeVar(t0))
 		err = check.Run()
+		runningChecksStats.Delete(string(check.ID()))
 		longRunning := check.Interval() == 0
 
 		warnings := check.GetWarnings()
@@ -316,20 +322,20 @@ func (r *Runner) work() {
 			// If the scheduler isn't assigned (it should), just add stats
 			// otherwise only do so if the check is in the scheduler
 			if r.scheduler == nil || r.scheduler.IsCheckScheduled(check.ID()) {
-				mStats, _ := check.GetMetricStats()
-				addWorkStats(check, time.Since(t0), err, warnings, mStats)
+				sStats, _ := check.GetSenderStats()
+				addWorkStats(check, time.Since(t0), err, warnings, sStats)
 			}
 		}
 		r.m.Unlock()
 
-		l := "Done running check %s"
+		l := "Done running check"
 		if doLog {
 			if lastLog {
 				l = l + fmt.Sprintf(", next runs will be logged every %v runs", config.Datadog.GetInt64("logging_frequency"))
 			}
-			log.Infof(l, check)
+			log.Infoc(l, "check", check.String())
 		} else {
-			log.Debugf(l, check)
+			log.Debugc(l, "check", check.String())
 		}
 
 		if check.Interval() == 0 {
@@ -369,12 +375,12 @@ func shouldLog(id check.ID) (doLog bool, lastLog bool) {
 	return
 }
 
-func addWorkStats(c check.Check, execTime time.Duration, err error, warnings []error, mStats map[string]int64) {
+func addWorkStats(c check.Check, execTime time.Duration, err error, warnings []error, mStats check.SenderStats) {
 	var s *check.Stats
 	var found bool
 
 	checkStats.M.Lock()
-	log.Debugf("Add stats for %s", string(c.ID()))
+	log.Tracef("Add stats for %s", string(c.ID()))
 	stats, found := checkStats.Stats[c.String()]
 	if !found {
 		stats = make(map[check.ID]*check.Stats)

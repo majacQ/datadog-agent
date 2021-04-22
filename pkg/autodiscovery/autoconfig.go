@@ -1,7 +1,7 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2016-2019 Datadog, Inc.
+// Copyright 2016-present Datadog, Inc.
 
 package autodiscovery
 
@@ -9,6 +9,7 @@ import (
 	"expvar"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/DataDog/datadog-agent/pkg/autodiscovery/configresolver"
@@ -21,6 +22,7 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/secrets"
 	"github.com/DataDog/datadog-agent/pkg/status/health"
 	"github.com/DataDog/datadog-agent/pkg/tagger"
+	"github.com/DataDog/datadog-agent/pkg/util/containers"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 	"github.com/DataDog/datadog-agent/pkg/util/retry"
 )
@@ -30,6 +32,8 @@ var (
 	acErrors              *expvar.Map
 	errorStats            = newAcErrorStats()
 )
+
+var secretsDecrypt = secrets.Decrypt
 
 func init() {
 	acErrors = expvar.NewMap("autoconfig")
@@ -58,23 +62,24 @@ type AutoConfig struct {
 	listenerCandidates map[string]listeners.ServiceListenerFactory
 	listenerRetryStop  chan struct{}
 	scheduler          *scheduler.MetaScheduler
-	healthPolling      *health.Handle
 	listenerStop       chan struct{}
 	healthListening    *health.Handle
 	newService         chan listeners.Service
 	delService         chan listeners.Service
 	store              *store
 	m                  sync.RWMutex
+	// ranOnce is an atomic uint32 set to 1 once the AutoConfig has been executed
+	ranOnce uint32
 }
 
 // NewAutoConfig creates an AutoConfig instance.
 func NewAutoConfig(scheduler *scheduler.MetaScheduler) *AutoConfig {
 	ac := &AutoConfig{
-		providers:          make([]*configPoller, 0, 8),
+		providers:          make([]*configPoller, 0, 9),
 		listenerCandidates: make(map[string]listeners.ServiceListenerFactory),
 		listenerRetryStop:  nil, // We'll open it if needed
 		listenerStop:       make(chan struct{}),
-		healthListening:    health.Register("ad-servicelistening"),
+		healthListening:    health.RegisterLiveness("ad-servicelistening"),
 		newService:         make(chan listeners.Service),
 		delService:         make(chan listeners.Service),
 		store:              newStore(),
@@ -95,7 +100,7 @@ func (ac *AutoConfig) serviceListening() {
 	for {
 		select {
 		case <-ac.listenerStop:
-			ac.healthListening.Deregister()
+			ac.healthListening.Deregister() //nolint:errcheck
 			return
 		case <-ac.healthListening.C:
 		case svc := <-ac.newService:
@@ -112,18 +117,18 @@ func (ac *AutoConfig) checkTagFreshness() {
 	// check if services tags are up to date
 	var servicesToRefresh []listeners.Service
 	for _, service := range ac.store.getServices() {
-		previousHash := ac.store.getTagsHashForService(service.GetEntity())
-		currentHash := tagger.GetEntityHash(service.GetEntity())
+		previousHash := ac.store.getTagsHashForService(service.GetTaggerEntity())
+		currentHash := tagger.GetEntityHash(service.GetTaggerEntity(), tagger.ChecksCardinality)
+		// Since an empty hash is a valid value, and we are not able to differentiate
+		// an empty tagger or store with an empty value.
+		// So we only look at the difference between current and previous
 		if currentHash != previousHash {
-			ac.store.setTagsHashForService(service.GetEntity(), currentHash)
-			if previousHash != "" {
-				// only refresh service if we already had a hash to avoid resetting it
-				servicesToRefresh = append(servicesToRefresh, service)
-			}
+			ac.store.setTagsHashForService(service.GetTaggerEntity(), currentHash)
+			servicesToRefresh = append(servicesToRefresh, service)
 		}
 	}
 	for _, service := range servicesToRefresh {
-		log.Debugf("Tags changed for service %s, rescheduling associated checks if any", service.GetEntity())
+		log.Debugf("Tags changed for service %s, rescheduling associated checks if any", service.GetTaggerEntity())
 		ac.processDelService(service)
 		ac.processNewService(service)
 	}
@@ -190,6 +195,16 @@ func (ac *AutoConfig) AddConfigProvider(provider providers.ConfigProvider, shoul
 func (ac *AutoConfig) LoadAndRun() {
 	resolvedConfigs := ac.GetAllConfigs()
 	ac.schedule(resolvedConfigs)
+	atomic.StoreUint32(&ac.ranOnce, 1)
+	log.Debug("LoadAndRun done.")
+}
+
+// HasRunOnce returns true if the AutoConfig has ran once.
+func (ac *AutoConfig) HasRunOnce() bool {
+	if ac == nil {
+		return false
+	}
+	return atomic.LoadUint32(&ac.ranOnce) == 1
 }
 
 // GetAllConfigs queries all the providers and returns all the integration
@@ -281,17 +296,10 @@ func (ac *AutoConfig) processNewConfig(config integration.Config) []integration.
 			return configs
 		}
 
-		// each template can resolve to multiple configs
-		for _, config := range resolvedConfigs {
-			config, err := decryptConfig(config)
-			if err != nil {
-				log.Errorf("Dropping conf for %q: %s", config.Name, err.Error())
-				continue
-			}
-			configs = append(configs, config)
-		}
-		return configs
+		return resolvedConfigs
 	}
+
+	// decrypt and store non-template config in AC as well
 	config, err := decryptConfig(config)
 	if err != nil {
 		log.Errorf("Dropping conf for '%s': %s", config.Name, err.Error())
@@ -299,8 +307,8 @@ func (ac *AutoConfig) processNewConfig(config integration.Config) []integration.
 	}
 	configs = append(configs, config)
 
-	// store non template configs in the AC
 	ac.store.setLoadedConfig(config)
+
 	return configs
 }
 
@@ -417,27 +425,27 @@ func decryptConfig(conf integration.Config) (integration.Config, error) {
 	var err error
 
 	// init_config
-	conf.InitConfig, err = secrets.Decrypt(conf.InitConfig, conf.Name)
+	conf.InitConfig, err = secretsDecrypt(conf.InitConfig, conf.Name)
 	if err != nil {
 		return conf, fmt.Errorf("error while decrypting secrets in 'init_config': %s", err)
 	}
 
 	// instances
 	for idx := range conf.Instances {
-		conf.Instances[idx], err = secrets.Decrypt(conf.Instances[idx], conf.Name)
+		conf.Instances[idx], err = secretsDecrypt(conf.Instances[idx], conf.Name)
 		if err != nil {
 			return conf, fmt.Errorf("error while decrypting secrets in an instance: %s", err)
 		}
 	}
 
 	// metrics
-	conf.MetricConfig, err = secrets.Decrypt(conf.MetricConfig, conf.Name)
+	conf.MetricConfig, err = secretsDecrypt(conf.MetricConfig, conf.Name)
 	if err != nil {
 		return conf, fmt.Errorf("error while decrypting secrets in 'metrics': %s", err)
 	}
 
 	// logs
-	conf.LogsConfig, err = secrets.Decrypt(conf.LogsConfig, conf.Name)
+	conf.LogsConfig, err = secretsDecrypt(conf.LogsConfig, conf.Name)
 	if err != nil {
 		return conf, fmt.Errorf("error while decrypting secrets 'logs': %s", err)
 	}
@@ -519,21 +527,26 @@ func (ac *AutoConfig) resolveTemplate(tpl integration.Config) []integration.Conf
 	return resolved
 }
 
-// resolveTemplateForService calls the config resolver for the template against the service
-// and stores the resolved config and service mapping if successful
+// resolveTemplateForService calls the config resolver for the template against the service,
+// decrypts secrets and stores the resolved config and service mapping if successful
 func (ac *AutoConfig) resolveTemplateForService(tpl integration.Config, svc listeners.Service) (integration.Config, error) {
-	resolvedConfig, err := configresolver.Resolve(tpl, svc)
+	config, tagsHash, err := configresolver.Resolve(tpl, svc)
 	if err != nil {
 		newErr := fmt.Errorf("error resolving template %s for service %s: %v", tpl.Name, svc.GetEntity(), err)
 		errorStats.setResolveWarning(tpl.Name, newErr.Error())
 		return tpl, log.Warn(newErr)
 	}
+	resolvedConfig, err := decryptConfig(config)
+	if err != nil {
+		newErr := fmt.Errorf("error decrypting secrets in config %s for service %s: %v", config.Name, svc.GetEntity(), err)
+		return config, log.Warn(newErr)
+	}
 	ac.store.setLoadedConfig(resolvedConfig)
 	ac.store.addConfigForService(svc.GetEntity(), resolvedConfig)
 	ac.store.addConfigForTemplate(tpl.Digest(), resolvedConfig)
 	ac.store.setTagsHashForService(
-		svc.GetEntity(),
-		tagger.GetEntityHash(svc.GetEntity()),
+		svc.GetTaggerEntity(),
+		tagsHash,
 	)
 	errorStats.removeResolveWarnings(tpl.Name)
 	return resolvedConfig, nil
@@ -541,6 +554,10 @@ func (ac *AutoConfig) resolveTemplateForService(tpl integration.Config, svc list
 
 // GetLoadedConfigs returns configs loaded
 func (ac *AutoConfig) GetLoadedConfigs() map[string]integration.Config {
+	if ac == nil || ac.store == nil {
+		log.Error("Autoconfig store not initialized")
+		return map[string]integration.Config{}
+	}
 	return ac.store.getLoadedConfigs()
 }
 
@@ -564,6 +581,10 @@ func GetResolveWarnings() map[string][]string {
 func (ac *AutoConfig) processNewService(svc listeners.Service) {
 	// in any case, register the service and store its tag hash
 	ac.store.setServiceForEntity(svc, svc.GetEntity())
+	ac.store.setTagsHashForService(
+		svc.GetTaggerEntity(),
+		tagger.GetEntityHash(svc.GetTaggerEntity(), tagger.ChecksCardinality),
+	)
 
 	// get all the templates matching service identifiers
 	var templates []integration.Config
@@ -595,9 +616,12 @@ func (ac *AutoConfig) processNewService(svc listeners.Service) {
 	// FIXME: schedule new services as well
 	ac.schedule([]integration.Config{
 		{
-			LogsConfig:   integration.Data{},
-			Entity:       svc.GetEntity(),
-			CreationTime: svc.GetCreationTime(),
+			LogsConfig:      integration.Data{},
+			Entity:          svc.GetEntity(),
+			TaggerEntity:    svc.GetTaggerEntity(),
+			CreationTime:    svc.GetCreationTime(),
+			MetricsExcluded: svc.HasFilter(containers.MetricsFilter),
+			LogsExcluded:    svc.HasFilter(containers.LogsFilter),
 		},
 	})
 
@@ -609,13 +633,16 @@ func (ac *AutoConfig) processDelService(svc listeners.Service) {
 	configs := ac.store.getConfigsForService(svc.GetEntity())
 	ac.store.removeConfigsForService(svc.GetEntity())
 	ac.processRemovedConfigs(configs)
-	ac.store.removeTagsHashForService(svc.GetEntity())
+	ac.store.removeTagsHashForService(svc.GetTaggerEntity())
 	// FIXME: unschedule remove services as well
 	ac.unschedule([]integration.Config{
 		{
-			LogsConfig:   integration.Data{},
-			Entity:       svc.GetEntity(),
-			CreationTime: svc.GetCreationTime(),
+			LogsConfig:      integration.Data{},
+			Entity:          svc.GetEntity(),
+			TaggerEntity:    svc.GetTaggerEntity(),
+			CreationTime:    svc.GetCreationTime(),
+			MetricsExcluded: svc.HasFilter(containers.MetricsFilter),
+			LogsExcluded:    svc.HasFilter(containers.LogsFilter),
 		},
 	})
 }

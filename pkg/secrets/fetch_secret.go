@@ -1,9 +1,9 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2016-2019 Datadog, Inc.
+// Copyright 2016-present Datadog, Inc.
 
-// +build !windows
+// +build secrets
 
 package secrets
 
@@ -11,16 +11,24 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/DataDog/datadog-agent/pkg/telemetry"
 	"github.com/DataDog/datadog-agent/pkg/util/common"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
-const payloadVersion = "1.0"
+// PayloadVersion defines the current payload version sent to a secret backend
+const PayloadVersion = "1.0"
+
+var (
+	tlmSecretBackendElapsed = telemetry.NewGauge("secret_backend", "elapsed_ms", []string{"command", "exit_code"}, "Elapsed time of secret backend invocation")
+)
 
 type limitBuffer struct {
 	max int
@@ -40,40 +48,53 @@ func execCommand(inputPayload string) ([]byte, error) {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, secretBackendCommand, secretBackendArguments...)
-	if err := checkRights(cmd.Path); err != nil {
+	if err := checkRights(cmd.Path, secretBackendCommandAllowGroupExec); err != nil {
 		return nil, err
 	}
 
 	cmd.Stdin = strings.NewReader(inputPayload)
-	// setting an empty env in case some secrets were set using the ENV (ex: API_KEY)
-	cmd.Env = []string{}
 
 	stdout := limitBuffer{
 		buf: &bytes.Buffer{},
-		max: secretBackendOutputMaxSize,
+		max: SecretBackendOutputMaxSize,
 	}
 	stderr := limitBuffer{
 		buf: &bytes.Buffer{},
-		max: secretBackendOutputMaxSize,
+		max: SecretBackendOutputMaxSize,
 	}
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
+	start := time.Now()
 	err := cmd.Run()
+	elapsed := time.Since(start)
+	log.Debugf("secret_backend_command '%s' completed in %s", secretBackendCommand, elapsed)
+
 	if err != nil {
 		log.Errorf("secret_backend_command stderr: %s", stderr.buf.String())
+
+		exitCode := "unknown"
+		var e *exec.ExitError
+		if errors.As(err, &e) {
+			exitCode = strconv.Itoa(e.ExitCode())
+		} else if ctx.Err() == context.DeadlineExceeded {
+			exitCode = "timeout"
+		}
+		tlmSecretBackendElapsed.Add(float64(elapsed.Milliseconds()), secretBackendCommand, exitCode)
 
 		if ctx.Err() == context.DeadlineExceeded {
 			return nil, fmt.Errorf("error while running '%s': command timeout", secretBackendCommand)
 		}
 		return nil, fmt.Errorf("error while running '%s': %s", secretBackendCommand, err)
 	}
+	tlmSecretBackendElapsed.Add(float64(elapsed.Milliseconds()), secretBackendCommand, "0")
 	return stdout.buf.Bytes(), nil
 }
 
-type secret struct {
-	Value    string
-	ErrorMsg string `json:"error"`
+// Secret defines the structure for secrets in JSON output
+type Secret struct {
+	Value    string `json:"value,omitempty"`
+	ErrorMsg string `json:"error,omitempty"`
 }
 
 // for testing purpose
@@ -84,7 +105,7 @@ var runCommand = execCommand
 // the name of the configuration where the secret was referenced.
 func fetchSecret(secretsHandle []string, origin string) (map[string]string, error) {
 	payload := map[string]interface{}{
-		"version": payloadVersion,
+		"version": PayloadVersion,
 		"secrets": secretsHandle,
 	}
 	jsonPayload, err := json.Marshal(payload)
@@ -97,7 +118,7 @@ func fetchSecret(secretsHandle []string, origin string) (map[string]string, erro
 		return nil, err
 	}
 
-	secrets := map[string]secret{}
+	secrets := map[string]Secret{}
 	err = json.Unmarshal(output, &secrets)
 	if err != nil {
 		return nil, fmt.Errorf("could not unmarshal 'secret_backend_command' output: %s", err)

@@ -1,7 +1,7 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2016-2019 Datadog, Inc.
+// Copyright 2016-present Datadog, Inc.
 
 // +build clusterchecks
 
@@ -50,9 +50,9 @@ func (h *Handler) GetState() (types.StateResponse, error) {
 	}
 }
 
-// GetConfigs returns configurations dispatched to a given node
-func (h *Handler) GetConfigs(nodeName string) (types.ConfigResponse, error) {
-	configs, lastChange, err := h.dispatcher.getNodeConfigs(nodeName)
+// GetConfigs returns configurations dispatched to a given agent
+func (h *Handler) GetConfigs(identifier string) (types.ConfigResponse, error) {
+	configs, lastChange, err := h.dispatcher.getClusterCheckConfigs(identifier)
 	response := types.ConfigResponse{
 		Configs:    configs,
 		LastChange: lastChange,
@@ -61,10 +61,52 @@ func (h *Handler) GetConfigs(nodeName string) (types.ConfigResponse, error) {
 }
 
 // PostStatus handles status reports from the node agents
-func (h *Handler) PostStatus(nodeName string, status types.NodeStatus) (types.StatusResponse, error) {
-	upToDate, err := h.dispatcher.processNodeStatus(nodeName, status)
+func (h *Handler) PostStatus(identifier, clientIP string, status types.NodeStatus) (types.StatusResponse, error) {
+	upToDate, err := h.dispatcher.processNodeStatus(identifier, clientIP, status)
 	response := types.StatusResponse{
 		IsUpToDate: upToDate,
 	}
 	return response, err
+}
+
+// GetEndpointsConfigs returns endpoints configurations dispatched to a given node
+func (h *Handler) GetEndpointsConfigs(nodeName string) (types.ConfigResponse, error) {
+	configs, err := h.dispatcher.getEndpointsConfigs(nodeName)
+	response := types.ConfigResponse{
+		Configs:    configs,
+		LastChange: 0,
+	}
+	return response, err
+}
+
+// GetAllEndpointsCheckConfigs returns all pod-backed dispatched endpointscheck configurations
+func (h *Handler) GetAllEndpointsCheckConfigs() (types.ConfigResponse, error) {
+	configs, err := h.dispatcher.getAllEndpointsCheckConfigs()
+	response := types.ConfigResponse{
+		Configs:    configs,
+		LastChange: 0,
+	}
+	return response, err
+}
+
+func (h *Handler) RebalanceClusterChecks() ([]types.RebalanceResponse, error) {
+	if !h.dispatcher.advancedDispatching {
+		return nil, fmt.Errorf("no checks to rebalance: advanced dispatching is not enabled")
+	}
+
+	rebalancingDecisions := h.dispatcher.rebalance()
+	response := []types.RebalanceResponse{}
+
+	for _, decision := range rebalancingDecisions {
+		response = append(response, types.RebalanceResponse{
+			CheckID:        decision.CheckID,
+			CheckWeight:    decision.CheckWeight,
+			SourceNodeName: decision.SourceNodeName,
+			SourceDiff:     decision.SourceDiff,
+			DestNodeName:   decision.DestNodeName,
+			DestDiff:       decision.DestDiff,
+		})
+	}
+
+	return response, nil
 }

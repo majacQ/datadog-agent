@@ -1,196 +1,245 @@
+// Unless explicitly stated otherwise all files in this repository are licensed
+// under the Apache License Version 2.0.
+// This product includes software developed at Datadog (https://www.datadoghq.com/).
+// Copyright 2016-present Datadog, Inc.
+
 package writer
 
 import (
-	"bytes"
 	"compress/gzip"
-	"strings"
+	"io/ioutil"
+	"reflect"
+	"sync"
 	"testing"
 
 	"github.com/DataDog/datadog-agent/pkg/trace/config"
-	"github.com/DataDog/datadog-agent/pkg/trace/info"
-	"github.com/DataDog/datadog-agent/pkg/trace/metrics"
 	"github.com/DataDog/datadog-agent/pkg/trace/pb"
 	"github.com/DataDog/datadog-agent/pkg/trace/test/testutil"
 	"github.com/DataDog/datadog-agent/pkg/trace/traceutil"
-	writerconfig "github.com/DataDog/datadog-agent/pkg/trace/writer/config"
 	"github.com/gogo/protobuf/proto"
 	"github.com/stretchr/testify/assert"
 )
 
-var testHostName = "testhost"
-var testEnv = "testenv"
-
 func TestTraceWriter(t *testing.T) {
-	t.Run("payload flushing", func(t *testing.T) {
-		assert := assert.New(t)
+	srv := newTestServer()
+	cfg := &config.AgentConfig{
+		Hostname:   testHostname,
+		DefaultEnv: testEnv,
+		Endpoints: []*config.Endpoint{{
+			APIKey: "123",
+			Host:   srv.URL,
+		}},
+		TraceWriter: &config.WriterConfig{ConnectionLimit: 200, QueueSize: 40},
+	}
 
-		// Create a trace writer, its incoming channel and the endpoint that receives the payloads
-		traceWriter, traceChannel, testEndpoint, _ := testTraceWriter()
-		// Set a maximum of 4 spans per payload
-		traceWriter.conf.MaxSpansPerPayload = 4
-		traceWriter.Start()
-
-		// Send a few sampled traces through the writer
-		sampledTraces := []*TracePackage{
-			// These 2 should be grouped together in a single payload
-			randomTracePackage(1, 1),
-			randomTracePackage(1, 1),
-			// This one should be on its own in a single payload
-			randomTracePackage(3, 1),
-			// This one should be on its own in a single payload
-			randomTracePackage(5, 1),
-			// This one should be on its own in a single payload
-			randomTracePackage(1, 1),
+	t.Run("ok", func(t *testing.T) {
+		testSpans := []*SampledSpans{
+			randomSampledSpans(20, 8),
+			randomSampledSpans(10, 0),
+			randomSampledSpans(40, 5),
 		}
-		for _, sampledTrace := range sampledTraces {
-			traceChannel <- sampledTrace
+		// Use a flush threshold that allows the first two entries to not overflow,
+		// but overflow on the third.
+		defer useFlushThreshold(testSpans[0].Size + testSpans[1].Size + 10)()
+		tw := NewTraceWriter(cfg)
+		tw.In = make(chan *SampledSpans)
+		go tw.Run()
+		for _, ss := range testSpans {
+			tw.In <- ss
 		}
-
-		// Stop the trace writer to force everything to flush
-		close(traceChannel)
-		traceWriter.Stop()
-
-		expectedHeaders := map[string]string{
-			"X-Datadog-Reported-Languages": strings.Join(info.Languages(), "|"),
-			"Content-Type":                 "application/x-protobuf",
-			"Content-Encoding":             "gzip",
-		}
-
-		// Ensure that the number of payloads and their contents match our expectations. The MaxSpansPerPayload we
-		// set to 4 at the beginning should have been respected whenever possible.
-		assert.Len(testEndpoint.SuccessPayloads(), 4, "We expected 4 different payloads")
-		assertPayloads(assert, traceWriter, expectedHeaders, sampledTraces, testEndpoint.SuccessPayloads())
+		tw.Stop()
+		// One payload flushes due to overflowing the threshold, and the second one
+		// because of stop.
+		assert.Equal(t, 2, srv.Accepted())
+		payloadsContain(t, srv.Payloads(), testSpans)
 	})
 }
 
-func calculateTracePayloadSize(sampledTraces []*TracePackage) int64 {
-	apiTraces := make([]*pb.APITrace, len(sampledTraces))
-
-	for i, trace := range sampledTraces {
-		apiTraces[i] = traceutil.APITrace(trace.Trace)
-	}
-
-	tracePayload := pb.TracePayload{
-		HostName: testHostName,
-		Env:      testEnv,
-		Traces:   apiTraces,
-	}
-
-	serialized, _ := proto.Marshal(&tracePayload)
-
-	compressionBuffer := bytes.Buffer{}
-	gz, err := gzip.NewWriterLevel(&compressionBuffer, gzip.BestSpeed)
-
-	if err != nil {
-		panic(err)
-	}
-
-	_, err = gz.Write(serialized)
-	gz.Close()
-
-	if err != nil {
-		panic(err)
-	}
-
-	return int64(len(compressionBuffer.Bytes()))
-}
-
-func assertPayloads(assert *assert.Assertions, traceWriter *TraceWriter, expectedHeaders map[string]string,
-	sampledTraces []*TracePackage, payloads []*payload) {
-
-	var expectedTraces []pb.Trace
-	var expectedEvents []*pb.Span
-
-	for _, sampledTrace := range sampledTraces {
-		expectedTraces = append(expectedTraces, sampledTrace.Trace)
-
-		for _, event := range sampledTrace.Events {
-			expectedEvents = append(expectedEvents, event)
+func TestTraceWriterMultipleEndpointsConcurrent(t *testing.T) {
+	var (
+		srv = newTestServer()
+		cfg = &config.AgentConfig{
+			Hostname:   testHostname,
+			DefaultEnv: testEnv,
+			Endpoints: []*config.Endpoint{
+				{
+					APIKey: "123",
+					Host:   srv.URL,
+				},
+				{
+					APIKey: "123",
+					Host:   srv.URL,
+				},
+			},
+			TraceWriter: &config.WriterConfig{ConnectionLimit: 200, QueueSize: 40},
 		}
+		numWorkers      = 10
+		numOpsPerWorker = 100
+	)
+
+	testSpans := []*SampledSpans{
+		randomSampledSpans(20, 8),
+		randomSampledSpans(10, 0),
+		randomSampledSpans(40, 5),
 	}
+	tw := NewTraceWriter(cfg)
+	tw.In = make(chan *SampledSpans, 100)
+	go tw.Run()
 
-	var expectedTraceIdx int
-	var expectedEventIdx int
-
-	for _, payload := range payloads {
-		assert.Equal(expectedHeaders, payload.headers, "Payload headers should match expectation")
-
-		var tracePayload pb.TracePayload
-		payloadBuffer := bytes.NewBuffer(payload.bytes)
-		gz, err := gzip.NewReader(payloadBuffer)
-		assert.NoError(err, "Gzip reader should work correctly")
-		uncompressedBuffer := bytes.Buffer{}
-		_, err = uncompressedBuffer.ReadFrom(gz)
-		gz.Close()
-		assert.NoError(err, "Should uncompress ok")
-		assert.NoError(proto.Unmarshal(uncompressedBuffer.Bytes(), &tracePayload), "Unmarshalling should work correctly")
-
-		assert.Equal(testEnv, tracePayload.Env, "Envs should match")
-		assert.Equal(testHostName, tracePayload.HostName, "Hostnames should match")
-
-		numSpans := 0
-
-		for _, seenAPITrace := range tracePayload.Traces {
-			numSpans += len(seenAPITrace.Spans)
-
-			if !assert.True(proto.Equal(traceutil.APITrace(expectedTraces[expectedTraceIdx]), seenAPITrace),
-				"Unmarshalled trace should match expectation at index %d", expectedTraceIdx) {
-				return
+	var wg sync.WaitGroup
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < numOpsPerWorker; j++ {
+				for _, ss := range testSpans {
+					tw.In <- ss
+				}
 			}
+		}()
+	}
 
-			expectedTraceIdx++
-		}
+	wg.Wait()
+	tw.Stop()
+	payloadsContain(t, srv.Payloads(), testSpans)
+}
 
-		for _, seenTransaction := range tracePayload.Transactions {
-			numSpans++
+// useFlushThreshold sets n as the number of bytes to be used as the flush threshold
+// and returns a function to restore it.
+func useFlushThreshold(n int) func() {
+	old := MaxPayloadSize
+	MaxPayloadSize = n
+	return func() { MaxPayloadSize = old }
+}
 
-			if !assert.True(proto.Equal(expectedEvents[expectedEventIdx], seenTransaction),
-				"Unmarshalled transaction should match expectation at index %d", expectedTraceIdx) {
-				return
+// randomSampledSpans returns a set of spans sampled spans and events events.
+func randomSampledSpans(spans, events int) *SampledSpans {
+	realisticIDs := true
+	trace := testutil.GetTestTraces(1, spans, realisticIDs)[0]
+	return &SampledSpans{
+		Traces:    []*pb.APITrace{traceutil.APITrace(trace)},
+		Events:    trace[:events],
+		Size:      trace.Msgsize() + pb.Trace(trace[:events]).Msgsize(),
+		SpanCount: int64(len(trace)),
+	}
+}
+
+// payloadsContain checks that the given payloads contain the given set of sampled spans.
+func payloadsContain(t *testing.T, payloads []*payload, sampledSpans []*SampledSpans) {
+	t.Helper()
+	var all pb.TracePayload
+	for _, p := range payloads {
+		assert := assert.New(t)
+		gzipr, err := gzip.NewReader(p.body)
+		assert.NoError(err)
+		slurp, err := ioutil.ReadAll(gzipr)
+		assert.NoError(err)
+		var payload pb.TracePayload
+		err = proto.Unmarshal(slurp, &payload)
+		assert.NoError(err)
+		assert.Equal(payload.HostName, testHostname)
+		assert.Equal(payload.Env, testEnv)
+		all.Traces = append(all.Traces, payload.Traces...)
+		all.Transactions = append(all.Transactions, payload.Transactions...)
+	}
+	for _, ss := range sampledSpans {
+		var found bool
+		for _, trace := range all.Traces {
+			if reflect.DeepEqual(trace.Spans, ss.Traces[0].Spans) {
+				found = true
+				break
 			}
-
-			expectedEventIdx++
 		}
-
-		// If there's more than 1 trace or transaction in this payload, don't let it go over the limit. Otherwise,
-		// a single trace+transaction combination is allows to go over the limit.
-		if len(tracePayload.Traces) > 1 || len(tracePayload.Transactions) > 1 {
-			assert.True(numSpans <= traceWriter.conf.MaxSpansPerPayload)
+		if !found {
+			t.Fatal("payloads didn't contain given traces")
+		}
+		for _, event := range ss.Events {
+			assert.Contains(t, all.Transactions, event)
 		}
 	}
 }
 
-func testTraceWriter() (*TraceWriter, chan *TracePackage, *testEndpoint, *testutil.TestStatsClient) {
-	payloadChannel := make(chan *TracePackage)
-	conf := &config.AgentConfig{
-		Hostname:          testHostName,
-		DefaultEnv:        testEnv,
-		TraceWriterConfig: writerconfig.DefaultTraceWriterConfig(),
+func TestTraceWriterFlushSync(t *testing.T) {
+	srv := newTestServer()
+	cfg := &config.AgentConfig{
+		Hostname:   testHostname,
+		DefaultEnv: testEnv,
+		Endpoints: []*config.Endpoint{{
+			APIKey: "123",
+			Host:   srv.URL,
+		}},
+		TraceWriter:         &config.WriterConfig{ConnectionLimit: 200, QueueSize: 40},
+		SynchronousFlushing: true,
 	}
-	traceWriter := NewTraceWriter(conf, payloadChannel)
-	testEndpoint := &testEndpoint{}
-	traceWriter.sender.setEndpoint(testEndpoint)
-	testStatsClient := metrics.Client.(*testutil.TestStatsClient)
-	testStatsClient.Reset()
+	t.Run("ok", func(t *testing.T) {
+		testSpans := []*SampledSpans{
+			randomSampledSpans(20, 8),
+			randomSampledSpans(10, 0),
+			randomSampledSpans(40, 5),
+		}
+		tw := NewTraceWriter(cfg)
+		go tw.Run()
+		for _, ss := range testSpans {
+			tw.In <- ss
+		}
 
-	return traceWriter, payloadChannel, testEndpoint, testStatsClient
+		// No payloads should be sent before flushing
+		assert.Equal(t, 0, srv.Accepted())
+		tw.FlushSync()
+		// Now all trace payloads should be sent
+		assert.Equal(t, 1, srv.Accepted())
+		payloadsContain(t, srv.Payloads(), testSpans)
+	})
 }
 
-func randomTracePackage(numSpans, numEvents int) *TracePackage {
-	if numSpans < numEvents {
-		panic("can't have more events than spans in a RandomSampledTrace")
+func TestTraceWriterSyncStop(t *testing.T) {
+	srv := newTestServer()
+	cfg := &config.AgentConfig{
+		Hostname:   testHostname,
+		DefaultEnv: testEnv,
+		Endpoints: []*config.Endpoint{{
+			APIKey: "123",
+			Host:   srv.URL,
+		}},
+		TraceWriter:         &config.WriterConfig{ConnectionLimit: 200, QueueSize: 40},
+		SynchronousFlushing: true,
 	}
+	t.Run("ok", func(t *testing.T) {
+		testSpans := []*SampledSpans{
+			randomSampledSpans(20, 8),
+			randomSampledSpans(10, 0),
+			randomSampledSpans(40, 5),
+		}
+		tw := NewTraceWriter(cfg)
+		go tw.Run()
+		for _, ss := range testSpans {
+			tw.In <- ss
+		}
 
-	trace := testutil.GetTestTrace(1, numSpans, true)[0]
+		// No payloads should be sent before flushing
+		assert.Equal(t, 0, srv.Accepted())
+		tw.Stop()
+		// Now all trace payloads should be sent
+		assert.Equal(t, 1, srv.Accepted())
+		payloadsContain(t, srv.Payloads(), testSpans)
+	})
+}
 
-	events := make([]*pb.Span, 0, numEvents)
-
-	for _, span := range trace[:numEvents] {
-		events = append(events, span)
+func TestTraceWriterSyncNoop(t *testing.T) {
+	srv := newTestServer()
+	cfg := &config.AgentConfig{
+		Hostname:   testHostname,
+		DefaultEnv: testEnv,
+		Endpoints: []*config.Endpoint{{
+			APIKey: "123",
+			Host:   srv.URL,
+		}},
+		TraceWriter:         &config.WriterConfig{ConnectionLimit: 200, QueueSize: 40},
+		SynchronousFlushing: false,
 	}
-
-	return &TracePackage{
-		Trace:  trace,
-		Events: events,
-	}
+	t.Run("ok", func(t *testing.T) {
+		tw := NewTraceWriter(cfg)
+		err := tw.FlushSync()
+		assert.NotNil(t, err)
+	})
 }

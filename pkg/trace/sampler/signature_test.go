@@ -1,11 +1,19 @@
+// Unless explicitly stated otherwise all files in this repository are licensed
+// under the Apache License Version 2.0.
+// This product includes software developed at Datadog (https://www.datadoghq.com/).
+// Copyright 2016-present Datadog, Inc.
+
 package sampler
 
 import (
+	"hash/fnv"
 	"testing"
 
 	"github.com/DataDog/datadog-agent/pkg/trace/pb"
 	"github.com/DataDog/datadog-agent/pkg/trace/traceutil"
+
 	"github.com/stretchr/testify/assert"
+	"k8s.io/apimachinery/pkg/util/rand"
 )
 
 func testComputeSignature(trace pb.Trace) Signature {
@@ -68,6 +76,30 @@ func TestSignatureDifferentRoot(t *testing.T) {
 	assert.NotEqual(testComputeSignature(t1), testComputeSignature(t2))
 }
 
+func TestSignatureDifference(t *testing.T) {
+	type testCase struct {
+		name string
+		meta map[string]string
+	}
+	testCases := []testCase{
+		{"status-code", map[string]string{KeyHTTPStatusCode: "200"}},
+		{"error-type", map[string]string{KeyErrorType: "error: nil"}},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert := assert.New(t)
+			t1 := pb.Trace{
+				&pb.Span{TraceID: 101, SpanID: 1011, Service: "x1", Name: "y1", Resource: "z1", Duration: 26965},
+			}
+			t2 := pb.Trace{
+				&pb.Span{TraceID: 103, SpanID: 1031, Service: "x1", Name: "y1", Resource: "z1", Duration: 19207, Meta: tc.meta},
+			}
+			assert.NotEqual(testComputeSignature(t1), testComputeSignature(t2))
+		})
+	}
+}
+
 func testComputeServiceSignature(trace pb.Trace) Signature {
 	root := traceutil.GetRoot(trace)
 	env := traceutil.GetEnv(trace)
@@ -125,4 +157,37 @@ func TestServiceSignatureDifferentEnv(t *testing.T) {
 	}
 
 	assert.NotEqual(testComputeServiceSignature(t1), testComputeServiceSignature(t2))
+}
+
+func TestSum32a(t *testing.T) {
+	assert := assert.New(t)
+	testList := []string{"this", "is", "just", "a", "sanity", "check", "Съешь же ещё этих мягких французских булок да выпей чаю"}
+	for _, s := range testList {
+		h := fnv.New32a()
+		h.Write([]byte(s))
+		expected := h.Sum32()
+
+		h2 := new32a()
+		h2.Write([]byte(s))
+		actual := h2.Sum32()
+
+		assert.Equal(expected, actual)
+	}
+}
+
+func BenchmarkServiceSignature_Hash(b *testing.B) {
+	s1 := rand.String(10)
+	s2 := rand.String(10)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		ServiceSignature{s1, s2}.Hash()
+	}
+}
+
+func BenchmarkComputeSpanHash(b *testing.B) {
+	span := &pb.Span{TraceID: 101, SpanID: 1014, ParentID: 1013, Service: "x2", Name: "y2", Resource: "z2", Duration: 34384993}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		computeSpanHash(span, "prod", true)
+	}
 }

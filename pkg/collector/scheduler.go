@@ -1,7 +1,7 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2016-2019 Datadog, Inc.
+// Copyright 2016-present Datadog, Inc.
 
 package collector
 
@@ -14,7 +14,10 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/autodiscovery/integration"
 	"github.com/DataDog/datadog-agent/pkg/collector/check"
 	"github.com/DataDog/datadog-agent/pkg/collector/loaders"
+	"github.com/DataDog/datadog-agent/pkg/util/containers"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
+
+	yaml "gopkg.in/yaml.v2"
 )
 
 var (
@@ -22,6 +25,14 @@ var (
 	errorStats     = newCollectorErrors()
 	checkScheduler *CheckScheduler
 )
+
+type commonInitConfig struct {
+	LoaderName string `yaml:"loader"`
+}
+
+type commonInstanceConfig struct {
+	LoaderName string `yaml:"loader"`
+}
 
 func init() {
 	schedulerErrs = expvar.NewMap("CheckScheduler")
@@ -60,7 +71,6 @@ func InitCheckScheduler(collector *Collector) *CheckScheduler {
 func (s *CheckScheduler) Schedule(configs []integration.Config) {
 	checks := s.GetChecksFromConfigs(configs, true)
 	for _, c := range checks {
-		log.Infof("Scheduling check %s", c)
 		_, err := s.collector.RunCheck(c)
 		if err != nil {
 			log.Errorf("Unable to run Check %s: %v", c, err)
@@ -73,8 +83,8 @@ func (s *CheckScheduler) Schedule(configs []integration.Config) {
 // Unschedule unschedules checks matching configs
 func (s *CheckScheduler) Unschedule(configs []integration.Config) {
 	for _, config := range configs {
-		if !isCheckConfig(config) {
-			// skip non check configs.
+		if !config.IsCheckConfig() || config.HasFilter(containers.MetricsFilter) {
+			// skip non check and excluded configs.
 			continue
 		}
 		// unschedule all the possible checks corresponding to this config
@@ -131,22 +141,72 @@ func (s *CheckScheduler) AddLoader(loader check.Loader) {
 // getChecks takes a check configuration and returns a slice of Check instances
 // along with any error it might happen during the process
 func (s *CheckScheduler) getChecks(config integration.Config) ([]check.Check, error) {
-	for _, loader := range s.loaders {
-		res, err := loader.Load(config)
-		if err == nil {
-			log.Debugf("%v: successfully loaded check '%s'", loader, config.Name)
-			errorStats.removeLoaderErrors(config.Name)
-			return res, nil
+	checks := []check.Check{}
+	numLoaders := len(s.loaders)
+
+	initConfig := commonInitConfig{}
+	err := yaml.Unmarshal(config.InitConfig, &initConfig)
+	if err != nil {
+		return nil, err
+	}
+	selectedLoader := initConfig.LoaderName
+
+	for _, instance := range config.Instances {
+		errors := []string{}
+		selectedInstanceLoader := selectedLoader
+		instanceConfig := commonInstanceConfig{}
+
+		err := yaml.Unmarshal(instance, &instanceConfig)
+		if err != nil {
+			log.Warnf("Unable to parse instance config for check `%s`: %v", config.Name, instance)
+			continue
 		}
-		// Check if some check instances were loaded correctly (can occur if there's multiple check instances)
-		if len(res) != 0 {
-			return res, nil
+
+		if instanceConfig.LoaderName != "" {
+			selectedInstanceLoader = instanceConfig.LoaderName
 		}
-		errorStats.setLoaderError(config.Name, fmt.Sprintf("%v", loader), err.Error())
-		log.Debugf("%v: unable to load the check '%s': %s", loader, config.Name, err)
+		if selectedInstanceLoader != "" {
+			log.Debugf("Loading check instance for check '%s' using loader %s (init_config loader: %s, instance loader: %s)", config.Name, selectedInstanceLoader, initConfig.LoaderName, instanceConfig.LoaderName)
+		} else {
+			log.Debugf("Loading check instance for check '%s' using default loaders", config.Name)
+		}
+
+		for _, loader := range s.loaders {
+			// the loader is skipped if the loader name is set and does not match
+			if (selectedInstanceLoader != "") && (selectedInstanceLoader != loader.Name()) {
+				log.Debugf("Loader name %v does not match, skip loader %v for check %v", selectedInstanceLoader, loader.Name(), config.Name)
+				continue
+			}
+			c, err := loader.Load(config, instance)
+			if err == nil {
+				log.Debugf("%v: successfully loaded check '%s'", loader, config.Name)
+				errorStats.removeLoaderErrors(config.Name)
+				checks = append(checks, c)
+				break
+			} else if c != nil && check.IsJMXInstance(config.Name, instance, config.InitConfig) {
+				// JMXfetch is more permissive than the agent regarding instance configuration. It
+				// accepts tags as a map and a list whether the agent only accepts tags as a list
+				// we still attempt to schedule the check but we save the error.
+				log.Debugf("%v: loading issue for JMX check '%s', the agent will still attempt to schedule it", loader, config.Name)
+				errorStats.setLoaderError(config.Name, fmt.Sprintf("%v", loader), err.Error())
+				checks = append(checks, c)
+				break
+			} else {
+				errorStats.setLoaderError(config.Name, fmt.Sprintf("%v", loader), err.Error())
+				errors = append(errors, fmt.Sprintf("%v: %s", loader, err))
+			}
+		}
+
+		if len(errors) == numLoaders {
+			log.Debugf("Unable to load a check from instance of config '%s': %s", config.Name, strings.Join(errors, "; "))
+		}
 	}
 
-	return []check.Check{}, fmt.Errorf("unable to load any check from config '%s'", config.Name)
+	if len(checks) == 0 {
+		return checks, fmt.Errorf("unable to load any check from config '%s'", config.Name)
+	}
+
+	return checks, nil
 }
 
 // GetChecksByNameForConfigs returns checks matching name for passed in configs
@@ -174,8 +234,12 @@ func (s *CheckScheduler) GetChecksFromConfigs(configs []integration.Config, popu
 
 	var allChecks []check.Check
 	for _, config := range configs {
-		if !isCheckConfig(config) {
+		if !config.IsCheckConfig() {
 			// skip non check configs.
+			continue
+		}
+		if config.HasFilter(containers.MetricsFilter) {
+			log.Debugf("Config %s is filtered out for metrics collection, ignoring it", config.Name)
 			continue
 		}
 		configDigest := config.Digest()
@@ -194,11 +258,6 @@ func (s *CheckScheduler) GetChecksFromConfigs(configs []integration.Config, popu
 	}
 
 	return allChecks
-}
-
-// isCheckConfig returns true if the config is a node-agent check configuration,
-func isCheckConfig(config integration.Config) bool {
-	return config.ClusterCheck == false && len(config.Instances) > 0
 }
 
 // GetLoaderErrors returns the check loader errors

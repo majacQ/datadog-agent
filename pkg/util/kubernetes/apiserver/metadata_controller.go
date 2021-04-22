@@ -1,7 +1,7 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2016-2019 Datadog, Inc.
+// Copyright 2016-present Datadog, Inc.
 
 // +build kubeapiserver
 
@@ -37,6 +37,8 @@ type MetadataController struct {
 	nodeLister       corelisters.NodeLister
 	nodeListerSynced cache.InformerSynced
 
+	namespaceListerSynced cache.InformerSynced
+
 	endpointsLister       corelisters.EndpointsLister
 	endpointsListerSynced cache.InformerSynced
 
@@ -46,7 +48,7 @@ type MetadataController struct {
 	queue workqueue.RateLimitingInterface
 }
 
-func NewMetadataController(nodeInformer coreinformers.NodeInformer, endpointsInformer coreinformers.EndpointsInformer) *MetadataController {
+func NewMetadataController(nodeInformer coreinformers.NodeInformer, namespaceInformer coreinformers.NamespaceInformer, endpointsInformer coreinformers.EndpointsInformer) *MetadataController {
 	m := &MetadataController{
 		queue: workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "endpoints"),
 	}
@@ -56,6 +58,8 @@ func NewMetadataController(nodeInformer coreinformers.NodeInformer, endpointsInf
 	})
 	m.nodeLister = nodeInformer.Lister()
 	m.nodeListerSynced = nodeInformer.Informer().HasSynced
+
+	m.namespaceListerSynced = namespaceInformer.Informer().HasSynced
 
 	endpointsInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    m.addEndpoints,
@@ -76,12 +80,11 @@ func (m *MetadataController) Run(stopCh <-chan struct{}) {
 	log.Infof("Starting metadata controller")
 	defer log.Infof("Stopping metadata controller")
 
-	if !cache.WaitForCacheSync(stopCh, m.nodeListerSynced, m.endpointsListerSynced) {
+	if !cache.WaitForCacheSync(stopCh, m.nodeListerSynced, m.namespaceListerSynced, m.endpointsListerSynced) {
 		return
 	}
 
 	go wait.Until(m.worker, time.Second, stopCh)
-
 	<-stopCh
 }
 
@@ -111,7 +114,8 @@ func (m *MetadataController) addNode(obj interface{}) {
 		return
 	}
 
-	_ = m.store.getOrCreate(node.Name)
+	bundle := m.store.getCopyOrNew(node.Name)
+	m.store.set(node.Name, bundle)
 
 	log.Debugf("Detected node %s", node.Name)
 }
@@ -245,16 +249,13 @@ func (m *MetadataController) mapEndpoints(endpoints *corev1.Endpoints) error {
 	svc := endpoints.Name
 	namespace := endpoints.Namespace
 	for nodeName, ns := range nodeToPods {
-		metaBundle := m.store.getOrCreate(nodeName)
-
-		metaBundle.m.Lock()
+		metaBundle := m.store.getCopyOrNew(nodeName)
 		metaBundle.Services.Delete(namespace, svc) // cleanup pods deleted from the service
 		for _, pods := range ns {
 			for podName := range pods {
 				metaBundle.Services.Set(namespace, podName, svc)
 			}
 		}
-		metaBundle.m.Unlock()
 
 		m.store.set(nodeName, metaBundle)
 	}
@@ -270,17 +271,16 @@ func (m *MetadataController) deleteMappedEndpoints(namespace, svc string) error 
 
 	// Delete the service from the metadata bundle for each node.
 	for _, node := range nodes {
-		metaBundle, ok := m.store.get(node.Name)
+		oldBundle, ok := m.store.get(node.Name)
 		if !ok {
 			// Nothing to delete.
 			continue
 		}
+		newMetaBundle := newMetadataMapperBundle()
+		newMetaBundle.DeepCopy(oldBundle)
+		newMetaBundle.Services.Delete(namespace, svc)
 
-		metaBundle.m.Lock()
-		metaBundle.Services.Delete(namespace, svc)
-		metaBundle.m.Unlock()
-
-		m.store.set(node.Name, metaBundle)
+		m.store.set(node.Name, newMetaBundle)
 	}
 	return nil
 }
@@ -294,7 +294,7 @@ func GetPodMetadataNames(nodeName, ns, podName string) ([]string, error) {
 		return nil, nil
 	}
 
-	metaBundle, ok := metaBundleInterface.(*MetadataMapperBundle)
+	metaBundle, ok := metaBundleInterface.(*metadataMapperBundle)
 	if !ok {
 		return nil, fmt.Errorf("invalid cache format for the cacheKey: %s", cacheKey)
 	}
@@ -314,11 +314,7 @@ func GetPodMetadataNames(nodeName, ns, podName string) ([]string, error) {
 }
 
 // GetNodeLabels retrieves the labels of the queried node from the cache of the shared informer.
-func GetNodeLabels(nodeName string) (map[string]string, error) {
-	as, err := GetAPIClient()
-	if err != nil {
-		return nil, err
-	}
+func GetNodeLabels(as *APIClient, nodeName string) (map[string]string, error) {
 	if !config.Datadog.GetBool("kubernetes_collect_metadata_tags") {
 		return nil, log.Errorf("Metadata collection is disabled on the Cluster Agent")
 	}
@@ -330,4 +326,25 @@ func GetNodeLabels(nodeName string) (map[string]string, error) {
 		return nil, fmt.Errorf("cannot get node %s from the informer's cache", nodeName)
 	}
 	return node.Labels, nil
+}
+
+// GetNamespaceLabels retrieves the labels of the queried namespace from the cache of the shared informer.
+func GetNamespaceLabels(nsName string) (map[string]string, error) {
+	if !config.Datadog.GetBool("kubernetes_collect_metadata_tags") {
+		return nil, log.Errorf("Metadata collection is disabled on the Cluster Agent")
+	}
+
+	as, err := GetAPIClient()
+	if err != nil {
+		return nil, err
+	}
+
+	ns, err := as.InformerFactory.Core().V1().Namespaces().Lister().Get(nsName)
+	if err != nil {
+		return nil, err
+	}
+	if ns == nil {
+		return nil, fmt.Errorf("cannot get namespace %s from the informer's cache", nsName)
+	}
+	return ns.Labels, nil
 }

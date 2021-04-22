@@ -1,7 +1,7 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2016-2019 Datadog, Inc.
+// Copyright 2016-present Datadog, Inc.
 
 package scheduler
 
@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/DataDog/datadog-agent/pkg/telemetry"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 
 	"github.com/DataDog/datadog-agent/pkg/collector/check"
@@ -22,6 +23,11 @@ var (
 	schedulerExpvars       *expvar.Map
 	schedulerQueuesCount   = expvar.Int{}
 	schedulerChecksEntered = expvar.Int{}
+
+	tlmChecksEntered = telemetry.NewGauge("scheduler", "checks_entered",
+		[]string{"check_name"}, "How many checks are currently tracked by the scheduler")
+	tlmQueuesCount = telemetry.NewCounter("scheduler", "queues_count",
+		nil, "How many queues were opened")
 )
 
 func init() {
@@ -33,30 +39,33 @@ func init() {
 // Scheduler keeps things rolling.
 // More docs to come...
 type Scheduler struct {
-	checksPipe    chan<- check.Check          // The pipe the Runner pops the checks from, initially set to nil
-	done          chan bool                   // Guard for the main loop
-	halted        chan bool                   // Used to internally communicate all queues are done
-	started       chan bool                   // Used to internally communicate the queues are up
-	jobQueues     map[time.Duration]*jobQueue // We have one scheduling queue for every interval
-	checkToQueue  map[check.ID]*jobQueue      // Keep track of what is the queue for any Check
-	mu            sync.Mutex                  // To protect critical sections in struct's fields
-	running       uint32                      // Flag to see if the scheduler is running
-	cancelOneTime chan bool                   // Used to internally communicate a cancel signal to one-time schedule goroutines
-	wgOneTime     sync.WaitGroup              // WaitGroup to track the exit of one-time schedule goroutines
+	running          uint32                      // Flag to see if the scheduler is running
+	checksPipe       chan<- check.Check          // The pipe the Runner pops the checks from, initially set to nil
+	done             chan bool                   // Guard for the main loop
+	halted           chan bool                   // Used to internally communicate all queues are done
+	started          chan bool                   // Used to internally communicate the queues are up
+	jobQueues        map[time.Duration]*jobQueue // We have one scheduling queue for every interval
+	checkToQueue     map[check.ID]*jobQueue      // Keep track of what is the queue for any Check
+	tlmTrackedChecks map[check.ID]string         // Keep track of the checks that are tracked with telemetry
+	mu               sync.Mutex                  // To protect critical sections in struct's fields
+
+	cancelOneTime chan bool      // Used to internally communicate a cancel signal to one-time schedule goroutines
+	wgOneTime     sync.WaitGroup // WaitGroup to track the exit of one-time schedule goroutines
 }
 
 // NewScheduler create a Scheduler and returns a pointer to it.
 func NewScheduler(checksPipe chan<- check.Check) *Scheduler {
 	return &Scheduler{
-		checksPipe:    checksPipe,
-		done:          make(chan bool),
-		halted:        make(chan bool),
-		started:       make(chan bool),
-		jobQueues:     make(map[time.Duration]*jobQueue),
-		checkToQueue:  make(map[check.ID]*jobQueue),
-		running:       0,
-		cancelOneTime: make(chan bool),
-		wgOneTime:     sync.WaitGroup{},
+		checksPipe:       checksPipe,
+		done:             make(chan bool),
+		halted:           make(chan bool),
+		started:          make(chan bool),
+		jobQueues:        make(map[time.Duration]*jobQueue),
+		checkToQueue:     make(map[check.ID]*jobQueue),
+		tlmTrackedChecks: make(map[check.ID]string),
+		running:          0,
+		cancelOneTime:    make(chan bool),
+		wgOneTime:        sync.WaitGroup{},
 	}
 }
 
@@ -82,6 +91,9 @@ func (s *Scheduler) Enter(check check.Check) error {
 	if _, ok := s.jobQueues[check.Interval()]; !ok {
 		s.jobQueues[check.Interval()] = newJobQueue(check.Interval())
 		s.startQueue(s.jobQueues[check.Interval()])
+		if check.IsTelemetryEnabled() {
+			tlmQueuesCount.Inc()
+		}
 		schedulerQueuesCount.Add(1)
 	}
 	s.jobQueues[check.Interval()].addJob(check)
@@ -89,6 +101,11 @@ func (s *Scheduler) Enter(check check.Check) error {
 	s.checkToQueue[check.ID()] = s.jobQueues[check.Interval()]
 
 	schedulerChecksEntered.Add(1)
+	if check.IsTelemetryEnabled() {
+		checkName := check.String()
+		s.tlmTrackedChecks[check.ID()] = checkName
+		tlmChecksEntered.Inc(checkName)
+	}
 	schedulerExpvars.Set("Queues", expvar.Func(expQueues(s)))
 	return nil
 }
@@ -113,6 +130,10 @@ func (s *Scheduler) Cancel(id check.ID) error {
 	delete(s.checkToQueue, id)
 
 	schedulerChecksEntered.Add(-1)
+	if checkName, ok := s.tlmTrackedChecks[id]; ok {
+		delete(s.tlmTrackedChecks, id)
+		tlmChecksEntered.Dec(checkName)
+	}
 	schedulerExpvars.Set("Queues", expvar.Func(expQueues(s)))
 	return nil
 }

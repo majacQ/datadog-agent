@@ -1,20 +1,25 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2016-2019 Datadog, Inc.
+// Copyright 2016-present Datadog, Inc.
 
 package dogstatsd
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
+	"os"
+	"sort"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/DataDog/datadog-agent/pkg/aggregator/ckey"
 	"github.com/DataDog/datadog-agent/pkg/config"
 	"github.com/DataDog/datadog-agent/pkg/metrics"
 )
@@ -44,7 +49,7 @@ func TestNewServer(t *testing.T) {
 	require.NoError(t, err)
 	config.Datadog.SetDefault("dogstatsd_port", port)
 
-	s, err := NewServer(nil, nil, nil)
+	s, err := NewServer(mockAggregator(), nil)
 	require.NoError(t, err, "cannot start DSD")
 	defer s.Stop()
 	assert.NotNil(t, s)
@@ -56,7 +61,7 @@ func TestStopServer(t *testing.T) {
 	require.NoError(t, err)
 	config.Datadog.SetDefault("dogstatsd_port", port)
 
-	s, err := NewServer(nil, nil, nil)
+	s, err := NewServer(mockAggregator(), nil)
 	require.NoError(t, err, "cannot start DSD")
 	s.Stop()
 
@@ -75,15 +80,14 @@ func TestStopServer(t *testing.T) {
 	require.NoError(t, err, "port is not available, it should be")
 }
 
-func TestUPDReceive(t *testing.T) {
+func TestUDPReceive(t *testing.T) {
 	port, err := getAvailableUDPPort()
 	require.NoError(t, err)
 	config.Datadog.SetDefault("dogstatsd_port", port)
 
-	metricOut := make(chan []*metrics.MetricSample)
-	eventOut := make(chan []*metrics.Event)
-	serviceOut := make(chan []*metrics.ServiceCheck)
-	s, err := NewServer(metricOut, eventOut, serviceOut)
+	agg := mockAggregator()
+	metricOut, eventOut, serviceOut := agg.GetBufferedChannels()
+	s, err := NewServer(agg, nil)
 	require.NoError(t, err, "cannot start DSD")
 	defer s.Stop()
 
@@ -162,8 +166,106 @@ func TestUPDReceive(t *testing.T) {
 		assert.FailNow(t, "Timeout on receive channel")
 	}
 
+	// multi-metric packet
+	conn.Write([]byte("daemon1:666|c\ndaemon2:1000|c"))
+	select {
+	case res := <-metricOut:
+		assert.Equal(t, 2, len(res))
+		sample1 := res[0]
+		assert.NotNil(t, sample1)
+		assert.Equal(t, sample1.Name, "daemon1")
+		assert.EqualValues(t, sample1.Value, 666.0)
+		assert.Equal(t, sample1.Mtype, metrics.CounterType)
+		sample2 := res[1]
+		assert.NotNil(t, sample2)
+		assert.Equal(t, sample2.Name, "daemon2")
+		assert.EqualValues(t, sample2.Value, 1000.0)
+		assert.Equal(t, sample2.Mtype, metrics.CounterType)
+	case <-time.After(2 * time.Second):
+		assert.FailNow(t, "Timeout on receive channel")
+	}
+
+	// multi-value packet
+	conn.Write([]byte("daemon1:666:123|c\ndaemon2:1000|c"))
+	select {
+	case res := <-metricOut:
+		assert.Equal(t, 3, len(res))
+		sample1 := res[0]
+		assert.NotNil(t, sample1)
+		assert.Equal(t, sample1.Name, "daemon1")
+		assert.EqualValues(t, sample1.Value, 666.0)
+		assert.Equal(t, sample1.Mtype, metrics.CounterType)
+		sample2 := res[1]
+		assert.NotNil(t, sample2)
+		assert.Equal(t, sample2.Name, "daemon1")
+		assert.EqualValues(t, sample2.Value, 123.0)
+		assert.Equal(t, sample2.Mtype, metrics.CounterType)
+		sample3 := res[2]
+		assert.NotNil(t, sample3)
+		assert.Equal(t, sample3.Name, "daemon2")
+		assert.EqualValues(t, sample3.Value, 1000.0)
+		assert.Equal(t, sample3.Mtype, metrics.CounterType)
+	case <-time.After(2 * time.Second):
+		assert.FailNow(t, "Timeout on receive channel")
+	}
+
+	// multi-value packet with skip empty
+	conn.Write([]byte("daemon1::666::123::::|c\ndaemon2:1000|c"))
+	select {
+	case res := <-metricOut:
+		assert.Equal(t, 3, len(res))
+		sample1 := res[0]
+		assert.NotNil(t, sample1)
+		assert.Equal(t, sample1.Name, "daemon1")
+		assert.EqualValues(t, sample1.Value, 666.0)
+		assert.Equal(t, sample1.Mtype, metrics.CounterType)
+		sample2 := res[1]
+		assert.NotNil(t, sample2)
+		assert.Equal(t, sample2.Name, "daemon1")
+		assert.EqualValues(t, sample2.Value, 123.0)
+		assert.Equal(t, sample2.Mtype, metrics.CounterType)
+		sample3 := res[2]
+		assert.NotNil(t, sample3)
+		assert.Equal(t, sample3.Name, "daemon2")
+		assert.EqualValues(t, sample3.Value, 1000.0)
+		assert.Equal(t, sample3.Mtype, metrics.CounterType)
+	case <-time.After(2 * time.Second):
+		assert.FailNow(t, "Timeout on receive channel")
+	}
+	// slightly malformed multi-metric packet, should still be parsed in whole
+	conn.Write([]byte("daemon1:666|c\n\ndaemon2:1000|c\n"))
+	select {
+	case res := <-metricOut:
+		assert.Equal(t, 2, len(res))
+		sample1 := res[0]
+		assert.NotNil(t, sample1)
+		assert.Equal(t, sample1.Name, "daemon1")
+		assert.EqualValues(t, sample1.Value, 666.0)
+		assert.Equal(t, sample1.Mtype, metrics.CounterType)
+		sample2 := res[1]
+		assert.NotNil(t, sample2)
+		assert.Equal(t, sample2.Name, "daemon2")
+		assert.EqualValues(t, sample2.Value, 1000.0)
+		assert.Equal(t, sample2.Mtype, metrics.CounterType)
+	case <-time.After(2 * time.Second):
+		assert.FailNow(t, "Timeout on receive channel")
+	}
+
 	// Test erroneous metric
-	conn.Write([]byte("daemon1:666:777|g\ndaemon2:666|g|#sometag1:somevalue1,sometag2:somevalue2"))
+	conn.Write([]byte("daemon1:666a|g\ndaemon2:666|g|#sometag1:somevalue1,sometag2:somevalue2"))
+	select {
+	case res := <-metricOut:
+		assert.Equal(t, 1, len(res))
+		sample := res[0]
+
+		assert.NotNil(t, sample)
+		assert.Equal(t, sample.Name, "daemon2")
+	case <-time.After(2 * time.Second):
+		assert.FailNow(t, "Timeout on receive channel")
+	}
+
+	// Test empty metric
+	conn.Write([]byte("daemon1:|g\ndaemon2:666|g|#sometag1:somevalue1,sometag2:somevalue2\ndaemon3: :1:|g"))
 	select {
 	case res := <-metricOut:
 		assert.Equal(t, 1, len(res))
@@ -207,8 +309,14 @@ func TestUPDReceive(t *testing.T) {
 		assert.FailNow(t, "Timeout on receive channel")
 	}
 
-	// Test erroneous Event
-	conn.Write([]byte("_e{10,0}:test title|\n_e{11,10}:test title2|test\\ntext|t:warning|d:12345|p:low|h:some.host|k:aggKey|s:source test|#tag1,tag2:test"))
+	// Test erroneous Events
+	conn.Write(
+		[]byte("_e{0,9}:|test text\n" +
+			"_e{-5,2}:abc\n" +
+			"_e{11,10}:test title2|test\\ntext|" +
+			"t:warning|d:12345|p:low|h:some.host|k:aggKey|s:source test|#tag1,tag2:test",
+		),
+	)
 	select {
 	case res := <-eventOut:
 		assert.Equal(t, 1, len(res))
@@ -239,10 +347,8 @@ func TestUDPForward(t *testing.T) {
 	require.NoError(t, err)
 	config.Datadog.SetDefault("dogstatsd_port", port)
 
-	metricOut := make(chan []*metrics.MetricSample)
-	eventOut := make(chan []*metrics.Event)
-	serviceOut := make(chan []*metrics.ServiceCheck)
-	s, err := NewServer(metricOut, eventOut, serviceOut)
+	agg := mockAggregator()
+	s, err := NewServer(agg, nil)
 	require.NoError(t, err, "cannot start DSD")
 	defer s.Stop()
 
@@ -276,10 +382,9 @@ func TestHistToDist(t *testing.T) {
 	config.Datadog.SetDefault("histogram_copy_to_distribution_prefix", "dist.")
 	defer config.Datadog.SetDefault("histogram_copy_to_distribution_prefix", "")
 
-	metricOut := make(chan []*metrics.MetricSample)
-	eventOut := make(chan []*metrics.Event)
-	serviceOut := make(chan []*metrics.ServiceCheck)
-	s, err := NewServer(metricOut, eventOut, serviceOut)
+	agg := mockAggregator()
+	metricOut, _, _ := agg.GetBufferedChannels()
+	s, err := NewServer(agg, nil)
 	require.NoError(t, err, "cannot start DSD")
 	defer s.Stop()
 
@@ -309,6 +414,108 @@ func TestHistToDist(t *testing.T) {
 	}
 }
 
+func TestScanLines(t *testing.T) {
+
+	messages := []string{"foo", "bar", "baz", "quz", "hax", ""}
+	packet := []byte(strings.Join(messages, "\n"))
+	cnt := 0
+	advance, tok, eol, err := ScanLines(packet, true)
+	for tok != nil && err == nil {
+		cnt++
+		assert.Equal(t, eol, true)
+		packet = packet[advance:]
+		advance, tok, eol, err = ScanLines(packet, true)
+	}
+
+	assert.False(t, eol)
+	assert.Equal(t, 5, cnt)
+
+	cnt = 0
+	packet = []byte(strings.Join(messages[0:len(messages)-1], "\n"))
+	advance, tok, eol, err = ScanLines(packet, true)
+	for tok != nil && err == nil {
+		cnt++
+		packet = packet[advance:]
+		advance, tok, eol, err = ScanLines(packet, true)
+	}
+
+	assert.False(t, eol)
+	assert.Equal(t, 5, cnt)
+
+}
+
+func TestEOLParsing(t *testing.T) {
+
+	messages := []string{"foo", "bar", "baz", "quz", "hax", ""}
+	packet := []byte(strings.Join(messages, "\n"))
+	cnt := 0
+	msg := nextMessage(&packet, true)
+	for msg != nil {
+		assert.Equal(t, string(msg), messages[cnt])
+		msg = nextMessage(&packet, true)
+		cnt++
+	}
+
+	assert.Equal(t, 5, cnt)
+
+	packet = []byte(strings.Join(messages[0:len(messages)-1], "\r\n"))
+	cnt = 0
+	msg = nextMessage(&packet, true)
+	for msg != nil {
+		msg = nextMessage(&packet, true)
+		cnt++
+	}
+
+	assert.Equal(t, 4, cnt)
+
+}
+
+func TestE2EParsing(t *testing.T) {
+	port, err := getAvailableUDPPort()
+	require.NoError(t, err)
+	config.Datadog.SetDefault("dogstatsd_port", port)
+
+	agg := mockAggregator()
+	metricOut, _, _ := agg.GetBufferedChannels()
+	s, err := NewServer(agg, nil)
+	require.NoError(t, err, "cannot start DSD")
+
+	url := fmt.Sprintf("127.0.0.1:%d", config.Datadog.GetInt("dogstatsd_port"))
+	conn, err := net.Dial("udp", url)
+	require.NoError(t, err, "cannot connect to DSD socket")
+	defer conn.Close()
+
+	// Test metric
+	conn.Write([]byte("daemon:666|g|#foo:bar\ndaemon:666|g|#foo:bar"))
+	select {
+	case res := <-metricOut:
+		assert.Equal(t, len(res), 2)
+	case <-time.After(2 * time.Second):
+		assert.FailNow(t, "Timeout on receive channel")
+	}
+	s.Stop()
+
+	// EOL enabled
+	config.Datadog.SetDefault("dogstatsd_eol_required", []string{"udp"})
+	// reset to default
+	defer config.Datadog.SetDefault("dogstatsd_eol_required", []string{})
+
+	agg = mockAggregator()
+	metricOut, _, _ = agg.GetBufferedChannels()
+	s, err = NewServer(agg, nil)
+	require.NoError(t, err, "cannot start DSD")
+	defer s.Stop()
+
+	// Test metric expecting an EOL
+	conn.Write([]byte("daemon:666|g|#foo:bar\ndaemon:666|g|#foo:bar"))
+	select {
+	case res := <-metricOut:
+		assert.Equal(t, len(res), 1)
+	case <-time.After(2 * time.Second):
+		assert.FailNow(t, "Timeout on receive channel")
+	}
+}
+
 func TestExtraTags(t *testing.T) {
 	port, err := getAvailableUDPPort()
 	require.NoError(t, err)
@@ -316,10 +523,9 @@ func TestExtraTags(t *testing.T) {
 	config.Datadog.SetDefault("dogstatsd_tags", []string{"sometag3:somevalue3"})
 	defer config.Datadog.SetDefault("dogstatsd_tags", []string{})
 
-	metricOut := make(chan []*metrics.MetricSample)
-	eventOut := make(chan []*metrics.Event)
-	serviceOut := make(chan []*metrics.ServiceCheck)
-	s, err := NewServer(metricOut, eventOut, serviceOut)
+	agg := mockAggregator()
+	metricOut, _, _ := agg.GetBufferedChannels()
+	s, err := NewServer(agg, nil)
 	require.NoError(t, err, "cannot start DSD")
 	defer s.Stop()
 
@@ -342,4 +548,306 @@ func TestExtraTags(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		assert.FailNow(t, "Timeout on receive channel")
 	}
+}
+
+func TestDebugStatsSpike(t *testing.T) {
+	assert := assert.New(t)
+	agg := mockAggregator()
+	s, err := NewServer(agg, nil)
+	require.NoError(t, err, "cannot start DSD")
+	defer s.Stop()
+
+	s.EnableMetricsStats()
+	sample := metrics.MetricSample{Name: "some.metric1", Tags: make([]string, 0)}
+
+	send := func(count int) {
+		for i := 0; i < count; i++ {
+			s.storeMetricStats(sample)
+		}
+	}
+
+	send(10)
+	time.Sleep(1050 * time.Millisecond)
+	send(10)
+	time.Sleep(1050 * time.Millisecond)
+	send(10)
+	time.Sleep(1050 * time.Millisecond)
+	send(10)
+	time.Sleep(1050 * time.Millisecond)
+	send(500)
+
+	// stop the debug loop to avoid data race
+	s.DisableMetricsStats()
+	time.Sleep(500 * time.Millisecond)
+	assert.True(s.hasSpike())
+
+	s.EnableMetricsStats()
+	time.Sleep(1050 * time.Millisecond)
+	send(500)
+
+	// stop the debug loop to avoid data race
+	s.DisableMetricsStats()
+	time.Sleep(500 * time.Millisecond)
+	// it is no more considered a spike because we had another second with 500 metrics
+	assert.False(s.hasSpike())
+}
+
+func TestDebugStats(t *testing.T) {
+	agg := mockAggregator()
+	s, err := NewServer(agg, nil)
+	require.NoError(t, err, "cannot start DSD")
+	defer s.Stop()
+
+	s.EnableMetricsStats()
+
+	keygen := ckey.NewKeyGenerator()
+
+	// data
+	sample1 := metrics.MetricSample{Name: "some.metric1", Tags: make([]string, 0)}
+	sample2 := metrics.MetricSample{Name: "some.metric2", Tags: []string{"a"}}
+	sample3 := metrics.MetricSample{Name: "some.metric3", Tags: make([]string, 0)}
+	sample4 := metrics.MetricSample{Name: "some.metric4", Tags: []string{"b", "c"}}
+	sample5 := metrics.MetricSample{Name: "some.metric4", Tags: []string{"c", "b"}}
+	hash1 := keygen.Generate(sample1.Name, "", sample1.Tags)
+	hash2 := keygen.Generate(sample2.Name, "", sample2.Tags)
+	hash3 := keygen.Generate(sample3.Name, "", sample3.Tags)
+	hash4 := keygen.Generate(sample4.Name, "", sample4.Tags)
+	hash5 := keygen.Generate(sample5.Name, "", sample5.Tags)
+
+	// test ingestion and ingestion time
+	s.storeMetricStats(sample1)
+	s.storeMetricStats(sample2)
+	time.Sleep(10 * time.Millisecond)
+	s.storeMetricStats(sample1)
+
+	data, err := s.GetJSONDebugStats()
+	require.NoError(t, err, "cannot get debug stats")
+	require.NotNil(t, data)
+	require.NotEmpty(t, data)
+
+	var stats map[ckey.ContextKey]metricStat
+	err = json.Unmarshal(data, &stats)
+	require.NoError(t, err, "data is not valid")
+	require.Len(t, stats, 2, "two metrics should have been captured")
+
+	require.True(t, stats[hash1].LastSeen.After(stats[hash2].LastSeen), "some.metric1 should have appeared again after some.metric2")
+
+	s.storeMetricStats(sample3)
+	time.Sleep(10 * time.Millisecond)
+	s.storeMetricStats(sample1)
+
+	s.storeMetricStats(sample4)
+	s.storeMetricStats(sample5)
+	data, _ = s.GetJSONDebugStats()
+	err = json.Unmarshal(data, &stats)
+	require.NoError(t, err, "data is not valid")
+	require.Len(t, stats, 4, "4 metrics should have been captured")
+
+	// test stats array
+	metric1 := stats[hash1]
+	metric2 := stats[hash2]
+	metric3 := stats[hash3]
+	metric4 := stats[hash4]
+	metric5 := stats[hash5]
+
+	require.True(t, metric1.LastSeen.After(metric2.LastSeen), "some.metric1 should have appeared again after some.metric2")
+	require.True(t, metric1.LastSeen.After(metric3.LastSeen), "some.metric1 should have appeared again after some.metric3")
+	require.True(t, metric3.LastSeen.After(metric2.LastSeen), "some.metric3 should have appeared again after some.metric2")
+
+	require.Equal(t, metric1.Count, uint64(3))
+	require.Equal(t, metric2.Count, uint64(1))
+	require.Equal(t, metric3.Count, uint64(1))
+
+	// test context correctness
+	require.Equal(t, metric4.Tags, "b c")
+	require.Equal(t, metric5.Tags, "b c")
+	require.Equal(t, hash4, hash5)
+}
+
+func TestNoMappingsConfig(t *testing.T) {
+	datadogYaml := ``
+	samples := []metrics.MetricSample{}
+
+	port, err := getAvailableUDPPort()
+	require.NoError(t, err)
+	config.Datadog.SetDefault("dogstatsd_port", port)
+
+	config.Datadog.SetConfigType("yaml")
+	err = config.Datadog.ReadConfig(strings.NewReader(datadogYaml))
+	require.NoError(t, err)
+
+	s, err := NewServer(mockAggregator(), nil)
+	require.NoError(t, err, "cannot start DSD")
+
+	assert.Nil(t, s.mapper)
+
+	parser := newParser(newFloat64ListPool())
+	samples, err = s.parseMetricMessage(samples, parser, []byte("test.metric:666|g"), "")
+	assert.NoError(t, err)
+	assert.Len(t, samples, 1)
+}
+
+type MetricSample struct {
+	Name  string
+	Value float64
+	Tags  []string
+	Mtype metrics.MetricType
+}
+
+func TestMappingCases(t *testing.T) {
+	scenarios := []struct {
+		name              string
+		config            string
+		packets           []string
+		expectedSamples   []MetricSample
+		expectedCacheSize int
+	}{
+		{
+			name: "Simple OK case",
+			config: `
+dogstatsd_mapper_profiles:
+  - name: test
+    prefix: 'test.'
+    mappings:
+      - match: "test.job.duration.*.*"
+        name: "test.job.duration"
+        tags:
+          job_type: "$1"
+          job_name: "$2"
+      - match: "test.job.size.*.*"
+        name: "test.job.size"
+        tags:
+          foo: "$1"
+          bar: "$2"
+`,
+			packets: []string{
+				"test.job.duration.my_job_type.my_job_name:666|g",
+				"test.job.size.my_job_type.my_job_name:666|g",
+				"test.job.size.not_match:666|g",
+			},
+			expectedSamples: []MetricSample{
+				{Name: "test.job.duration", Tags: []string{"job_type:my_job_type", "job_name:my_job_name"}, Mtype: metrics.GaugeType, Value: 666.0},
+				{Name: "test.job.size", Tags: []string{"foo:my_job_type", "bar:my_job_name"}, Mtype: metrics.GaugeType, Value: 666.0},
+				{Name: "test.job.size.not_match", Tags: nil, Mtype: metrics.GaugeType, Value: 666.0},
+			},
+			expectedCacheSize: 1000,
+		},
+		{
+			name: "Tag already present",
+			config: `
+dogstatsd_mapper_profiles:
+  - name: test
+    prefix: 'test.'
+    mappings:
+      - match: "test.job.duration.*.*"
+        name: "test.job.duration"
+        tags:
+          job_type: "$1"
+          job_name: "$2"
+`,
+			packets: []string{
+				"test.job.duration.my_job_type.my_job_name:666|g",
+				"test.job.duration.my_job_type.my_job_name:666|g|#some:tag",
+				"test.job.duration.my_job_type.my_job_name:666|g|#some:tag,more:tags",
+			},
+			expectedSamples: []MetricSample{
+				{Name: "test.job.duration", Tags: []string{"job_type:my_job_type", "job_name:my_job_name"}, Mtype: metrics.GaugeType, Value: 666.0},
+				{Name: "test.job.duration", Tags: []string{"job_type:my_job_type", "job_name:my_job_name", "some:tag"}, Mtype: metrics.GaugeType, Value: 666.0},
+				{Name: "test.job.duration", Tags: []string{"job_type:my_job_type", "job_name:my_job_name", "some:tag", "more:tags"}, Mtype: metrics.GaugeType, Value: 666.0},
+			},
+			expectedCacheSize: 1000,
+		},
+		{
+			name: "Cache size",
+			config: `
+dogstatsd_mapper_cache_size: 999
+dogstatsd_mapper_profiles:
+  - name: test
+    prefix: 'test.'
+    mappings:
+      - match: "test.job.duration.*.*"
+        name: "test.job.duration"
+        tags:
+          job_type: "$1"
+          job_name: "$2"
+`,
+			packets:           []string{},
+			expectedSamples:   nil,
+			expectedCacheSize: 999,
+		},
+	}
+
+	samples := []metrics.MetricSample{}
+	for _, scenario := range scenarios {
+		t.Run(scenario.name, func(t *testing.T) {
+			config.Datadog.SetConfigType("yaml")
+			err := config.Datadog.ReadConfig(strings.NewReader(scenario.config))
+			assert.NoError(t, err, "Case `%s` failed. ReadConfig should not return error %v", scenario.name, err)
+
+			port, err := getAvailableUDPPort()
+			require.NoError(t, err, "Case `%s` failed. getAvailableUDPPort should not return error %v", scenario.name, err)
+			config.Datadog.SetDefault("dogstatsd_port", port)
+
+			s, err := NewServer(mockAggregator(), nil)
+			require.NoError(t, err, "Case `%s` failed. NewServer should not return error %v", scenario.name, err)
+
+			assert.Equal(t, config.Datadog.Get("dogstatsd_mapper_cache_size"), scenario.expectedCacheSize, "Case `%s` failed. cache_size `%s` should be `%s`", scenario.name, config.Datadog.Get("dogstatsd_mapper_cache_size"), scenario.expectedCacheSize)
+
+			var actualSamples []MetricSample
+			for _, p := range scenario.packets {
+				parser := newParser(newFloat64ListPool())
+				samples, err := s.parseMetricMessage(samples, parser, []byte(p), "")
+				assert.NoError(t, err, "Case `%s` failed. parseMetricMessage should not return error %v", err)
+				for _, sample := range samples {
+					actualSamples = append(actualSamples, MetricSample{Name: sample.Name, Tags: sample.Tags, Mtype: sample.Mtype, Value: sample.Value})
+				}
+			}
+			for _, sample := range scenario.expectedSamples {
+				sort.Strings(sample.Tags)
+			}
+			for _, sample := range actualSamples {
+				sort.Strings(sample.Tags)
+			}
+			assert.Equal(t, scenario.expectedSamples, actualSamples, "Case `%s` failed. `%s` should be `%s`", scenario.name, actualSamples, scenario.expectedSamples)
+			s.Stop()
+		})
+	}
+}
+
+func TestNewServerExtraTags(t *testing.T) {
+	require := require.New(t)
+	port, err := getAvailableUDPPort()
+	require.NoError(err)
+	config.Datadog.SetDefault("dogstatsd_port", port)
+
+	s, err := NewServer(mockAggregator(), nil)
+	require.NoError(err, "starting the DogStatsD server shouldn't fail")
+	require.Len(s.extraTags, 0, "no tags should have been read")
+	s.Stop()
+
+	// when the extraTags parameter isn't used, the DogStatsD server is not reading this env var
+	os.Setenv("DD_TAGS", "hello:world")
+	s, err = NewServer(mockAggregator(), nil)
+	require.NoError(err, "starting the DogStatsD server shouldn't fail")
+	require.Len(s.extraTags, 0, "no tags should have been read")
+	s.Stop()
+
+	// when the extraTags parameter isn't used, the DogStatsD server is automatically reading this env var for extra tags
+	os.Setenv("DD_DOGSTATSD_TAGS", "hello:world extra:tags")
+	s, err = NewServer(mockAggregator(), nil)
+	require.NoError(err, "starting the DogStatsD server shouldn't fail")
+	require.Len(s.extraTags, 2, "two tags should have been read")
+	require.Equal(s.extraTags[0], "hello:world", "the tag hello:world should be set")
+	require.Equal(s.extraTags[1], "extra:tags", "the tag extra:tags should be set")
+	s.Stop()
+
+	// when the extraTags parameter is used, it should be used as the extraTags for the server
+	// and the DD_DOGSTATSD_TAGS environment var should be ignored.
+	os.Setenv("DD_DOGSTATSD_TAGS", "hello:world") // this should be ignored
+	s, err = NewServer(mockAggregator(), []string{"extra:tags", "new:constructor"})
+	require.NoError(err, "starting the DogStatsD server shouldn't fail")
+	require.Len(s.extraTags, 2, "two tags should have been read")
+	require.Equal(s.extraTags[0], "extra:tags", "the tag extra:tags should be set")
+	require.Equal(s.extraTags[1], "new:constructor", "the tag new:constructor should be set")
+	s.Stop()
 }

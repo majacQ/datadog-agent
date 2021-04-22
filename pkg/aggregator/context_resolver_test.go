@@ -1,12 +1,15 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2016-2019 Datadog, Inc.
+// Copyright 2016-present Datadog, Inc.
+
+// +build test
 
 package aggregator
 
 import (
 	// stdlib
+	"sort"
 	"testing"
 
 	// 3p
@@ -27,7 +30,7 @@ func TestGenerateContextKey(t *testing.T) {
 	}
 
 	contextKey := generateContextKey(&mSample)
-	assert.Equal(t, "f15c7df5722489dd29b6dbcd0cafda62", contextKey.String())
+	assert.Equal(t, ckey.ContextKey(0xdd892472f57d5cf1), contextKey)
 }
 
 func TestTrackContext(t *testing.T) {
@@ -75,16 +78,18 @@ func TestTrackContext(t *testing.T) {
 
 	// When we look up the 2 keys, they return the correct contexts
 	context1 := contextResolver.contextsByKey[contextKey1]
+	sort.Strings(expectedContext1.Tags) // context tags are sorted
 	assert.Equal(t, expectedContext1, *context1)
 
 	context2 := contextResolver.contextsByKey[contextKey2]
+	sort.Strings(expectedContext2.Tags) // context tags are sorted
 	assert.Equal(t, expectedContext2, *context2)
 
 	context3 := contextResolver.contextsByKey[contextKey3]
+	sort.Strings(expectedContext3.Tags) // context tags are sorted
 	assert.Equal(t, expectedContext3, *context3)
 
-	// Looking for a missing context key returns an error
-	unknownContextKey, _ := ckey.Parse("ffffffffffffffffffffffffffffffff")
+	unknownContextKey := ckey.ContextKey(0xffffffffffffffff)
 	_, ok := contextResolver.contextsByKey[unknownContextKey]
 	assert.False(t, ok)
 }

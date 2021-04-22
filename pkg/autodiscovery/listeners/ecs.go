@@ -1,7 +1,7 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2017 Datadog, Inc.
+// Copyright 2017-present Datadog, Inc.
 
 // +build docker
 
@@ -15,7 +15,8 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/status/health"
 	"github.com/DataDog/datadog-agent/pkg/tagger"
 	"github.com/DataDog/datadog-agent/pkg/util/containers"
-	"github.com/DataDog/datadog-agent/pkg/util/ecs"
+	ecsmeta "github.com/DataDog/datadog-agent/pkg/util/ecs/metadata"
+	v2 "github.com/DataDog/datadog-agent/pkg/util/ecs/metadata/v2"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
@@ -23,8 +24,9 @@ import (
 // It pulls its tasks container list periodically and checks for
 // new containers to monitor, and old containers to stop monitoring
 type ECSListener struct {
-	task       ecs.TaskMetadata
-	filter     *containers.Filter
+	task       *v2.Task
+	client     *v2.Client
+	filters    *containerFilters
 	services   map[string]Service // maps container IDs to services
 	newService chan<- Service
 	delService chan<- Service
@@ -36,16 +38,21 @@ type ECSListener struct {
 
 // ECSService implements and store results from the Service interface for the ECS listener
 type ECSService struct {
-	cID           string
-	runtime       string
-	ADIdentifiers []string
-	hosts         map[string]string
-	tags          []string
-	clusterName   string
-	taskFamily    string
-	taskVersion   string
-	creationTime  integration.CreationTime
+	cID             string
+	runtime         string
+	ADIdentifiers   []string
+	hosts           map[string]string
+	clusterName     string
+	taskFamily      string
+	taskVersion     string
+	creationTime    integration.CreationTime
+	checkNames      []string
+	metricsExcluded bool
+	logsExcluded    bool
 }
+
+// Make sure ECSService implements the Service interface
+var _ Service = &ECSService{}
 
 func init() {
 	Register("ecs", NewECSListener)
@@ -53,16 +60,23 @@ func init() {
 
 // NewECSListener creates an ECSListener
 func NewECSListener() (ServiceListener, error) {
-	filter, err := containers.NewFilterFromConfigIncludePause()
+	client, err := ecsmeta.V2()
+	if err != nil {
+		log.Debugf("error while initializing ECS metadata V2 client: %s", err)
+		return nil, err
+	}
+
+	filters, err := newContainerFilters()
 	if err != nil {
 		return nil, err
 	}
 	return &ECSListener{
+		client:   client,
 		services: make(map[string]Service),
 		stop:     make(chan bool),
-		filter:   filter,
+		filters:  filters,
 		t:        time.NewTicker(2 * time.Second),
-		health:   health.Register("ad-ecslistener"),
+		health:   health.RegisterReadiness("ad-ecslistener"),
 	}, nil
 }
 
@@ -77,7 +91,7 @@ func (l *ECSListener) Listen(newSvc chan<- Service, delSvc chan<- Service) {
 		for {
 			select {
 			case <-l.stop:
-				l.health.Deregister()
+				l.health.Deregister() //nolint:errcheck
 				return
 			case <-l.health.C:
 			case <-l.t.C:
@@ -96,7 +110,7 @@ func (l *ECSListener) Stop() {
 // compares the container list to the local cache and sends new/dead services
 // over newService and delService accordingly
 func (l *ECSListener) refreshServices(firstRun bool) {
-	meta, err := ecs.GetTaskMetadata()
+	meta, err := l.client.GetTask()
 	if err != nil {
 		log.Errorf("failed to get task metadata, not refreshing services - %s", err)
 		return
@@ -114,6 +128,11 @@ func (l *ECSListener) refreshServices(firstRun bool) {
 	}
 
 	for _, c := range meta.Containers {
+		// Skip containers for which ECS failed to retrieve metadata
+		if c.DockerID == "" {
+			log.Debugf("Skipping a container for which ECS is reporting an empty ID: name %q, docker name: %q, image %q, image id: %q", c.Name, c.DockerName, c.Image, c.ImageID)
+			continue
+		}
 		if _, found := l.services[c.DockerID]; found {
 			delete(notSeen, c.DockerID)
 			continue
@@ -122,8 +141,13 @@ func (l *ECSListener) refreshServices(firstRun bool) {
 			log.Debugf("container %s is in status %s - skipping", c.DockerID, c.KnownStatus)
 			continue
 		}
-		if l.filter.IsExcluded(c.DockerName, c.Image) {
-			log.Debugf("container %s filtered out: name %q image %q", c.DockerID[:12], c.DockerName, c.Image)
+		// Detect AD exclusion
+		if l.filters.IsExcluded(containers.GlobalFilter, c.DockerName, c.Image, "") {
+			dockerID := c.DockerID
+			if len(c.DockerID) >= 12 {
+				dockerID = c.DockerID[:12]
+			}
+			log.Debugf("container %s filtered out: name %q image %q", dockerID, c.DockerName, c.Image)
 			continue
 		}
 		s, err := l.createService(c, firstRun)
@@ -148,7 +172,7 @@ func (l *ECSListener) refreshServices(firstRun bool) {
 	}
 }
 
-func (l *ECSListener) createService(c ecs.Container, firstRun bool) (ECSService, error) {
+func (l *ECSListener) createService(c v2.Container, firstRun bool) (ECSService, error) {
 	var crTime integration.CreationTime
 	if firstRun {
 		crTime = integration.Before
@@ -168,23 +192,25 @@ func (l *ECSListener) createService(c ecs.Container, firstRun bool) (ECSService,
 	image := c.Image
 	labels := c.Labels
 	svc.ADIdentifiers = ComputeContainerServiceIDs(svc.GetEntity(), image, labels)
+	var err error
+	svc.checkNames, err = getCheckNamesFromLabels(labels)
+	if err != nil {
+		log.Errorf("Error getting check names from docker labels on container %s: %v", c.DockerID, err)
+	}
 
 	// Host
 	ips := make(map[string]string)
 
 	for _, net := range c.Networks {
 		if net.NetworkMode == "awsvpc" && len(net.IPv4Addresses) > 0 {
-			ips["awsvpc"] = string(net.IPv4Addresses[0])
+			ips["awsvpc"] = net.IPv4Addresses[0]
 		}
 	}
 	svc.hosts = ips
 
-	// Tags
-	tags, err := tagger.Tag(svc.GetEntity(), tagger.ChecksCardinality)
-	if err != nil {
-		log.Errorf("Failed to extract tags for container %s - %s", c.DockerID[:12], err)
-	}
-	svc.tags = tags
+	// Detect metrics or logs exclusion
+	svc.metricsExcluded = l.filters.IsExcluded(containers.MetricsFilter, c.DockerName, c.Image, "")
+	svc.logsExcluded = l.filters.IsExcluded(containers.LogsFilter, c.DockerName, c.Image, "")
 
 	return svc, err
 }
@@ -192,6 +218,10 @@ func (l *ECSListener) createService(c ecs.Container, firstRun bool) (ECSService,
 // GetEntity returns the unique entity name linked to that service
 func (s *ECSService) GetEntity() string {
 	return containers.BuildEntityName(s.runtime, s.cID)
+}
+
+func (s *ECSService) GetTaggerEntity() string {
+	return containers.BuildTaggerEntityName(s.cID)
 }
 
 // GetADIdentifiers returns a set of AD identifiers for a container.
@@ -221,8 +251,8 @@ func (s *ECSService) GetPorts() ([]ContainerPort, error) {
 }
 
 // GetTags retrieves a container's tags
-func (s *ECSService) GetTags() ([]string, error) {
-	return s.tags, nil
+func (s *ECSService) GetTags() ([]string, string, error) {
+	return tagger.TagWithHash(s.GetTaggerEntity(), tagger.ChecksCardinality)
 }
 
 // GetPid inspect the container and return its pid
@@ -239,4 +269,30 @@ func (s *ECSService) GetHostname() (string, error) {
 // GetCreationTime returns the creation time of the container compare to the agent start.
 func (s *ECSService) GetCreationTime() integration.CreationTime {
 	return s.creationTime
+}
+
+func (s *ECSService) IsReady() bool {
+	return true
+}
+
+// GetCheckNames returns slice check names defined in docker labels
+func (s *ECSService) GetCheckNames() []string {
+	return s.checkNames
+}
+
+// HasFilter returns true if metrics or logs collection must be excluded for this service
+// no containers.GlobalFilter case here because we don't create services that are globally excluded in AD
+func (s *ECSService) HasFilter(filter containers.FilterType) bool {
+	switch filter {
+	case containers.MetricsFilter:
+		return s.metricsExcluded
+	case containers.LogsFilter:
+		return s.logsExcluded
+	}
+	return false
+}
+
+// GetExtraConfig isn't supported
+func (s *ECSService) GetExtraConfig(key []byte) ([]byte, error) {
+	return []byte{}, ErrNotSupported
 }

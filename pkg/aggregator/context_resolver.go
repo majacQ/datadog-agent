@@ -1,16 +1,16 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2016-2019 Datadog, Inc.
+// Copyright 2016-present Datadog, Inc.
 
 package aggregator
 
 import (
-	// stdlib
 	"fmt"
 
 	"github.com/DataDog/datadog-agent/pkg/aggregator/ckey"
 	"github.com/DataDog/datadog-agent/pkg/metrics"
+	"github.com/DataDog/datadog-agent/pkg/util"
 )
 
 // Context holds the elements that form a context, and can be serialized into a context key
@@ -24,33 +24,54 @@ type Context struct {
 type ContextResolver struct {
 	contextsByKey map[ckey.ContextKey]*Context
 	lastSeenByKey map[ckey.ContextKey]float64
+	keyGenerator  *ckey.KeyGenerator
+	// buffer slice allocated once per ContextResolver to combine and sort
+	// tags, origin detection tags and k8s tags.
+	tagsBuffer *util.TagsBuilder
 }
 
 // generateContextKey generates the contextKey associated with the context of the metricSample
-func generateContextKey(metricSample *metrics.MetricSample) ckey.ContextKey {
-	return ckey.Generate(metricSample.Name, metricSample.Host, metricSample.Tags)
+func (cr *ContextResolver) generateContextKey(metricSampleContext metrics.MetricSampleContext, tags *util.TagsBuilder) ckey.ContextKey {
+	return cr.keyGenerator.Generate(metricSampleContext.GetName(), metricSampleContext.GetHost(), tags.Get())
 }
 
 func newContextResolver() *ContextResolver {
 	return &ContextResolver{
 		contextsByKey: make(map[ckey.ContextKey]*Context),
 		lastSeenByKey: make(map[ckey.ContextKey]float64),
+		keyGenerator:  ckey.NewKeyGenerator(),
+		tagsBuffer:    util.NewTagsBuilder(),
 	}
 }
 
 // trackContext returns the contextKey associated with the context of the metricSample and tracks that context
-func (cr *ContextResolver) trackContext(metricSample *metrics.MetricSample, currentTimestamp float64) ckey.ContextKey {
-	contextKey := generateContextKey(metricSample)
+func (cr *ContextResolver) trackContext(metricSampleContext metrics.MetricSampleContext, currentTimestamp float64) ckey.ContextKey {
+	metricSampleContext.GetTags(cr.tagsBuffer)
+	contextKey := cr.generateContextKey(metricSampleContext, cr.tagsBuffer)
+
 	if _, ok := cr.contextsByKey[contextKey]; !ok {
+		// making a copy of tags for the context since tagsBuffer
+		// will be reused later. This allow us to allocate one slice
+		// per context instead of one per sample.
 		cr.contextsByKey[contextKey] = &Context{
-			Name: metricSample.Name,
-			Tags: metricSample.Tags,
-			Host: metricSample.Host,
+			Name: metricSampleContext.GetName(),
+			Tags: cr.tagsBuffer.Copy(),
+			Host: metricSampleContext.GetHost(),
 		}
 	}
 	cr.lastSeenByKey[contextKey] = currentTimestamp
 
+	cr.tagsBuffer.Reset()
 	return contextKey
+}
+
+func (cr *ContextResolver) get(key ckey.ContextKey) (*Context, bool) {
+	ctx, found := cr.contextsByKey[key]
+	return ctx, found
+}
+
+func (cr *ContextResolver) length() int {
+	return len(cr.contextsByKey)
 }
 
 // updateTrackedContext updates the last seen timestamp on a given context key

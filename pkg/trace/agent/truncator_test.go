@@ -1,3 +1,8 @@
+// Unless explicitly stated otherwise all files in this repository are licensed
+// under the Apache License Version 2.0.
+// This product includes software developed at Datadog (https://www.datadoghq.com/).
+// Copyright 2016-present Datadog, Inc.
+
 package agent
 
 import (
@@ -5,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/DataDog/datadog-agent/pkg/trace/pb"
+	"github.com/DataDog/datadog-agent/pkg/trace/traceutil"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -57,7 +63,7 @@ func TestTruncateMetricsKeyTooLong(t *testing.T) {
 	s.Metrics[key] = 42
 	Truncate(s)
 	for k := range s.Metrics {
-		assert.True(t, len(k) < MaxMetricsKeyLen+4)
+		assert.True(t, len(k) < traceutil.MaxMetricsKeyLen+4)
 	}
 }
 
@@ -74,7 +80,7 @@ func TestTruncateMetaKeyTooLong(t *testing.T) {
 	s.Meta[key] = "foo"
 	Truncate(s)
 	for k := range s.Meta {
-		assert.True(t, len(k) < MaxMetaKeyLen+4)
+		assert.True(t, len(k) < traceutil.MaxMetaKeyLen+4)
 	}
 }
 
@@ -84,15 +90,6 @@ func TestTruncateMetaValueTooLong(t *testing.T) {
 	s.Meta["foo"] = val
 	Truncate(s)
 	for _, v := range s.Meta {
-		assert.True(t, len(v) < MaxMetaValLen+4)
+		assert.True(t, len(v) < traceutil.MaxMetaValLen+4)
 	}
-}
-func TestTruncateString(t *testing.T) {
-	assert.Equal(t, "", truncateString("", 5))
-	assert.Equal(t, "télé", truncateString("télé", 5))
-	assert.Equal(t, "t", truncateString("télé", 2))
-	assert.Equal(t, "éé", truncateString("ééééé", 5))
-	assert.Equal(t, "ééééé", truncateString("ééééé", 18))
-	assert.Equal(t, "ééééé", truncateString("ééééé", 10))
-	assert.Equal(t, "ééé", truncateString("ééééé", 6))
 }

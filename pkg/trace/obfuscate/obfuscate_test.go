@@ -1,3 +1,8 @@
+// Unless explicitly stated otherwise all files in this repository are licensed
+// under the Apache License Version 2.0.
+// This product includes software developed at Datadog (https://www.datadoghq.com/).
+// Copyright 2016-present Datadog, Inc.
+
 package obfuscate
 
 import (
@@ -8,6 +13,7 @@ import (
 
 	"github.com/DataDog/datadog-agent/pkg/trace/config"
 	"github.com/DataDog/datadog-agent/pkg/trace/pb"
+
 	"github.com/cihub/seelog"
 	"github.com/stretchr/testify/assert"
 )
@@ -26,7 +32,7 @@ func TestMain(m *testing.M) {
 	// prepare JSON obfuscator tests
 	suite, err := loadTests()
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Failed to load JSON obfuscator tests: %s", err.Error())
 	}
 	if len(suite) == 0 {
 		log.Fatal("no tests in suite")
@@ -42,10 +48,7 @@ func TestNewObfuscator(t *testing.T) {
 	assert.Nil(o.es)
 	assert.Nil(o.mongo)
 
-	o = NewObfuscator(&config.ObfuscationConfig{
-		ES:    config.JSONObfuscationConfig{},
-		Mongo: config.JSONObfuscationConfig{},
-	})
+	o = NewObfuscator(nil)
 	assert.Nil(o.es)
 	assert.Nil(o.mongo)
 
@@ -82,6 +85,60 @@ func TestCompactWhitespaces(t *testing.T) {
 
 	for _, testCase := range resultsToExpect {
 		assert.Equal(testCase.after, compactWhitespaces(testCase.before))
+	}
+}
+
+func TestReplaceDigits(t *testing.T) {
+	assert := assert.New(t)
+
+	for _, tt := range []struct {
+		in       []byte
+		expected []byte
+	}{
+		{
+			[]byte("table123"),
+			[]byte("table?"),
+		},
+		{
+			[]byte(""),
+			[]byte(""),
+		},
+		{
+			[]byte("2020-table"),
+			[]byte("?-table"),
+		},
+		{
+			[]byte("sales_2019_07_01"),
+			[]byte("sales_?_?_?"),
+		},
+		{
+			[]byte("45"),
+			[]byte("?"),
+		},
+	} {
+		assert.Equal(tt.expected, replaceDigits(tt.in))
+	}
+}
+
+func TestObfuscateStatsGroup(t *testing.T) {
+	statsGroup := func(typ, resource string) *pb.ClientGroupedStats {
+		return &pb.ClientGroupedStats{
+			Type:     typ,
+			Resource: resource,
+		}
+	}
+	o := NewObfuscator(nil)
+	for _, tt := range []struct {
+		in  *pb.ClientGroupedStats // input stats
+		out string                 // output obfuscated resource
+	}{
+		{statsGroup("sql", "SELECT 1 FROM db"), "SELECT ? FROM db"},
+		{statsGroup("sql", "SELECT 1\nFROM Blogs AS [b\nORDER BY [b]"), nonParsableResource},
+		{statsGroup("redis", "ADD 1, 2"), "ADD"},
+		{statsGroup("other", "ADD 1, 2"), "ADD 1, 2"},
+	} {
+		o.ObfuscateStatsGroup(tt.in)
+		assert.Equal(t, tt.in.Resource, tt.out)
 	}
 }
 
@@ -133,9 +190,7 @@ func TestObfuscateConfig(t *testing.T) {
 		"redis.raw_command",
 		"SET key val",
 		"SET key ?",
-		&config.ObfuscationConfig{
-			Redis: config.Enablable{Enabled: true},
-		},
+		&config.ObfuscationConfig{Redis: config.Enablable{Enabled: true}},
 	))
 
 	t.Run("redis/disabled", testConfig(
@@ -151,12 +206,10 @@ func TestObfuscateConfig(t *testing.T) {
 		"http.url",
 		"http://mysite.mydomain/1/2?q=asd",
 		"http://mysite.mydomain/?/??",
-		&config.ObfuscationConfig{
-			HTTP: config.HTTPObfuscationConfig{
-				RemovePathDigits:  true,
-				RemoveQueryString: true,
-			},
-		},
+		&config.ObfuscationConfig{HTTP: config.HTTPObfuscationConfig{
+			RemovePathDigits:  true,
+			RemoveQueryString: true,
+		}},
 	))
 
 	t.Run("http/disabled", testConfig(
@@ -172,12 +225,10 @@ func TestObfuscateConfig(t *testing.T) {
 		"http.url",
 		"http://mysite.mydomain/1/2?q=asd",
 		"http://mysite.mydomain/?/??",
-		&config.ObfuscationConfig{
-			HTTP: config.HTTPObfuscationConfig{
-				RemovePathDigits:  true,
-				RemoveQueryString: true,
-			},
-		},
+		&config.ObfuscationConfig{HTTP: config.HTTPObfuscationConfig{
+			RemovePathDigits:  true,
+			RemoveQueryString: true,
+		}},
 	))
 
 	t.Run("web/disabled", testConfig(
@@ -211,9 +262,7 @@ func TestObfuscateConfig(t *testing.T) {
 		"memcached.command",
 		"set key 0 0 0\r\nvalue",
 		"set key 0 0 0",
-		&config.ObfuscationConfig{
-			Memcached: config.Enablable{Enabled: true},
-		},
+		&config.ObfuscationConfig{Memcached: config.Enablable{Enabled: true}},
 	))
 
 	t.Run("memcached/disabled", testConfig(
@@ -225,9 +274,34 @@ func TestObfuscateConfig(t *testing.T) {
 	))
 }
 
+func TestLiteralEscapes(t *testing.T) {
+	o := NewObfuscator(nil)
+
+	t.Run("default", func(t *testing.T) {
+		assert.False(t, o.SQLLiteralEscapes())
+	})
+
+	t.Run("true", func(t *testing.T) {
+		o.SetSQLLiteralEscapes(true)
+		assert.True(t, o.SQLLiteralEscapes())
+	})
+
+	t.Run("false", func(t *testing.T) {
+		o.SetSQLLiteralEscapes(false)
+		assert.False(t, o.SQLLiteralEscapes())
+	})
+}
+
 func BenchmarkCompactWhitespaces(b *testing.B) {
 	str := "a b       cde     fg       hi                     j  jk   lk lkjfdsalfd     afsd sfdafsd f"
 	for i := 0; i < b.N; i++ {
 		compactWhitespaces(str)
+	}
+}
+
+func BenchmarkReplaceDigits(b *testing.B) {
+	tbl := []byte("sales_2019_07_01_orders")
+	for i := 0; i < b.N; i++ {
+		replaceDigits(tbl)
 	}
 }

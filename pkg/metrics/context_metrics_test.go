@@ -1,7 +1,9 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2016-2019 Datadog, Inc.
+// Copyright 2016-present Datadog, Inc.
+
+// +build test
 
 package metrics
 
@@ -18,7 +20,7 @@ import (
 
 func TestContextMetricsGaugeSampling(t *testing.T) {
 	metrics := MakeContextMetrics()
-	contextKey, _ := ckey.Parse("ffffffffffffffffffffffffffffffff")
+	contextKey := ckey.ContextKey(0xffffffffffffffff)
 	mSample := MetricSample{
 		Value: 1,
 		Mtype: GaugeType,
@@ -44,7 +46,7 @@ func TestContextMetricsGaugeSampling(t *testing.T) {
 // Important for check metrics aggregation
 func TestContextMetricsGaugeSamplingNoSample(t *testing.T) {
 	metrics := MakeContextMetrics()
-	contextKey, _ := ckey.Parse("ffffffffffffffffffffffffffffffff")
+	contextKey := ckey.ContextKey(0xffffffffffffffff)
 	mSample := MetricSample{
 		Value: 1,
 		Mtype: GaugeType,
@@ -65,8 +67,8 @@ func TestContextMetricsGaugeSamplingNoSample(t *testing.T) {
 // Samples with values of +Inf/-Inf/NaN should be ignored
 func TestContextMetricsGaugeSamplingInvalidSamples(t *testing.T) {
 	metrics := MakeContextMetrics()
-	contextKey1, _ := ckey.Parse("aaffffffffffffffffffffffffffffff")
-	contextKey2, _ := ckey.Parse("bbffffffffffffffffffffffffffffff")
+	contextKey1 := ckey.ContextKey(0xaaffffffffffffff)
+	contextKey2 := ckey.ContextKey(0xbbffffffffffffff)
 
 	// +/-Inf
 	mSample1 := MetricSample{
@@ -116,7 +118,7 @@ func TestContextMetricsGaugeSamplingInvalidSamples(t *testing.T) {
 // Important for check metrics aggregation
 func TestContextMetricsSingleRateSampling(t *testing.T) {
 	metrics := MakeContextMetrics()
-	contextKey, _ := ckey.Parse("ffffffffffffffffffffffffffffffff")
+	contextKey := ckey.ContextKey(0xffffffffffffffff)
 
 	metrics.AddSample(contextKey, &MetricSample{Mtype: RateType, Value: 1}, 12340, 10)
 	series, err := metrics.Flush(12345)
@@ -145,7 +147,7 @@ func TestContextMetricsSingleRateSampling(t *testing.T) {
 // Important for check metrics aggregation
 func TestContextMetricsNegativeRateSampling(t *testing.T) {
 	metrics := MakeContextMetrics()
-	contextKey, _ := ckey.Parse("ffffffffffffffffffffffffffffffff")
+	contextKey := ckey.ContextKey(0xffffffffffffffff)
 
 	metrics.AddSample(contextKey, &MetricSample{Mtype: RateType, Value: 2}, 12340, 10)
 	metrics.AddSample(contextKey, &MetricSample{Mtype: RateType, Value: 1}, 12350, 10)
@@ -158,7 +160,7 @@ func TestContextMetricsNegativeRateSampling(t *testing.T) {
 
 func TestContextMetricsCountSampling(t *testing.T) {
 	metrics := MakeContextMetrics()
-	contextKey, _ := ckey.Parse("ffffffffffffffffffffffffffffffff")
+	contextKey := ckey.ContextKey(0xffffffffffffffff)
 
 	metrics.AddSample(contextKey, &MetricSample{Mtype: CountType, Value: 1}, 12340, 10)
 	metrics.AddSample(contextKey, &MetricSample{Mtype: CountType, Value: 5}, 12345, 10)
@@ -179,7 +181,7 @@ func TestContextMetricsCountSampling(t *testing.T) {
 
 func TestContextMetricsMonotonicCountSampling(t *testing.T) {
 	metrics := MakeContextMetrics()
-	contextKey, _ := ckey.Parse("ffffffffffffffffffffffffffffffff")
+	contextKey := ckey.ContextKey(0xffffffffffffffff)
 
 	metrics.AddSample(contextKey, &MetricSample{Mtype: MonotonicCountType, Value: 1}, 12340, 10)
 	metrics.AddSample(contextKey, &MetricSample{Mtype: MonotonicCountType, Value: 5}, 12345, 10)
@@ -200,7 +202,7 @@ func TestContextMetricsMonotonicCountSampling(t *testing.T) {
 
 func TestContextMetricsHistogramSampling(t *testing.T) {
 	metrics := MakeContextMetrics()
-	contextKey, _ := ckey.Parse("ffffffffffffffffffffffffffffffff")
+	contextKey := ckey.ContextKey(0xffffffffffffffff)
 
 	metrics.AddSample(contextKey, &MetricSample{Mtype: HistogramType, Value: 1}, 12340, 10)
 	metrics.AddSample(contextKey, &MetricSample{Mtype: HistogramType, Value: 2}, 12342, 10)
@@ -251,7 +253,7 @@ func TestContextMetricsHistogramSampling(t *testing.T) {
 
 func TestContextMetricsHistorateSampling(t *testing.T) {
 	metrics := MakeContextMetrics()
-	contextKey, _ := ckey.Parse("ffffffffffffffffffffffffffffffff")
+	contextKey := ckey.ContextKey(0xffffffffffffffff)
 
 	metrics.AddSample(contextKey, &MetricSample{Mtype: HistorateType, Value: 1}, 12340, 10)
 	metrics.AddSample(contextKey, &MetricSample{Mtype: HistorateType, Value: 2}, 12341, 10)

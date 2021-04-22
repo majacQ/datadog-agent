@@ -1,7 +1,7 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2017 Datadog, Inc.
+// Copyright 2017-present Datadog, Inc.
 
 // +build docker
 // +build kubeapiserver
@@ -9,7 +9,9 @@
 package kubernetes
 
 import (
+	"context"
 	"fmt"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"os"
 	"path/filepath"
 	"testing"
@@ -21,13 +23,13 @@ import (
 	"github.com/stretchr/testify/suite"
 
 	"github.com/DataDog/datadog-agent/pkg/config"
+	hostname_apiserver "github.com/DataDog/datadog-agent/pkg/util/hostname/apiserver"
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes/apiserver"
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes/clustername"
 )
 
 const (
-	setupTimeout     = 10 * time.Second
-	eventReadTimeout = 500 * time.Millisecond
+	setupTimeout = 10 * time.Second
 )
 
 type testSuite struct {
@@ -45,6 +47,7 @@ func TestSuiteKube(t *testing.T) {
 	require.Nil(t, err)
 	output, err := compose.Start()
 	defer compose.Stop()
+	t.Logf("error: %v", err)
 	require.Nil(t, err, string(output))
 
 	// Init apiclient
@@ -60,8 +63,10 @@ func TestSuiteKube(t *testing.T) {
 
 func (suite *testSuite) SetupTest() {
 	var err error
-
-	tick := time.NewTicker(time.Millisecond * 500)
+	resVer := ""
+	eventReadTimeout := int64(1)
+	lastList := time.Now()
+	tick := time.NewTicker(time.Millisecond * 100)
 	timeout := time.NewTicker(setupTimeout)
 	for {
 		select {
@@ -76,9 +81,9 @@ func (suite *testSuite) SetupTest() {
 			}
 			// Confirm that we can query the kube-apiserver's resources
 			log.Debugf("trying to get LatestEvents")
-			_, _, resV, err := suite.apiClient.LatestEvents("0", eventReadTimeout)
+			_, resVer, _, err := suite.apiClient.RunEventCollection(resVer, lastList, eventReadTimeout, 100, 300, "")
 			if err == nil {
-				log.Debugf("successfully get LatestEvents: %s", resV)
+				log.Debugf("successfully get LatestEvents: %s", resVer)
 				return
 			}
 			log.Debugf("cannot get LatestEvents: %s", err)
@@ -88,6 +93,9 @@ func (suite *testSuite) SetupTest() {
 
 func (suite *testSuite) TestKubeEvents() {
 	mockConfig := config.Mock()
+	resVer := ""
+	eventReadTimeout := int64(1)
+	lastList := time.Now()
 
 	// Init own client to write the events
 	mockConfig.Set("kubernetes_kubeconfig_path", suite.kubeConfigPath)
@@ -99,70 +107,58 @@ func (suite *testSuite) TestKubeEvents() {
 	require.NotNil(suite.T(), core)
 
 	// Ignore potential startup events
-	_, _, initresversion, err := suite.apiClient.LatestEvents("0", eventReadTimeout)
+	_, resVer, lastList, err = suite.apiClient.RunEventCollection(resVer, lastList, eventReadTimeout, 100, 300, "")
 	require.NoError(suite.T(), err)
 
 	// Create started event
 	testReference := createObjectReference("default", "integration_test", "event_test")
 	startedEvent := createEvent("default", "test_started", "started", *testReference)
-	_, err = core.Events("default").Create(startedEvent)
+	_, err = core.Events("default").Create(context.TODO(), startedEvent, v1.CreateOptions{})
 	require.NoError(suite.T(), err)
 
 	// Test we get the new started event
-	added, modified, resversion, err := suite.apiClient.LatestEvents(initresversion, eventReadTimeout)
+	added, resVer, lastList, err := suite.apiClient.RunEventCollection(resVer, lastList, eventReadTimeout, 100, 300, "")
 	require.NoError(suite.T(), err)
 	assert.Len(suite.T(), added, 1)
-	assert.Len(suite.T(), modified, 0)
 	assert.Equal(suite.T(), "started", added[0].Reason)
 
 	// Create tick event
 	tickEvent := createEvent("default", "test_tick", "tick", *testReference)
-	_, err = core.Events("default").Create(tickEvent)
+	_, err = core.Events("default").Create(context.TODO(), tickEvent, v1.CreateOptions{})
 	require.NoError(suite.T(), err)
 
 	// Test we get the new tick event
-	added, modified, resversion, err = suite.apiClient.LatestEvents(resversion, eventReadTimeout)
+	added, resVer, lastList, err = suite.apiClient.RunEventCollection(resVer, lastList, eventReadTimeout, 100, 300, "")
 	require.NoError(suite.T(), err)
 	assert.Len(suite.T(), added, 1)
-	assert.Len(suite.T(), modified, 0)
 	assert.Equal(suite.T(), "tick", added[0].Reason)
 
 	// Update tick event
 	pointer2 := int32(2)
 	tickEvent2 := added[0]
 	tickEvent2.Count = pointer2
-	tickEvent3, err := core.Events("default").Update(tickEvent2)
+	tickEvent3, err := core.Events("default").Update(context.TODO(), tickEvent2, v1.UpdateOptions{})
 	require.NoError(suite.T(), err)
 
 	// Update tick event a second time
 	pointer3 := int32(3)
 	tickEvent3.Count = pointer3
-	_, err = core.Events("default").Update(tickEvent3)
+	_, err = core.Events("default").Update(context.TODO(), tickEvent3, v1.UpdateOptions{})
 	require.NoError(suite.T(), err)
 
 	// Test we get the two modified test events
-	added, modified, resversion, err = suite.apiClient.LatestEvents(resversion, eventReadTimeout)
-	require.NoError(suite.T(), err)
-	assert.Len(suite.T(), added, 0)
-	assert.Len(suite.T(), modified, 2)
-	assert.Equal(suite.T(), "tick", modified[0].Reason)
-	assert.EqualValues(suite.T(), 2, modified[0].Count)
-	assert.Equal(suite.T(), "tick", modified[1].Reason)
-	assert.EqualValues(suite.T(), 3, modified[1].Count)
-	assert.EqualValues(suite.T(), modified[0].InvolvedObject.UID, modified[1].InvolvedObject.UID)
-
-	// We should get nothing new now
-	added, modified, resversion, err = suite.apiClient.LatestEvents(resversion, eventReadTimeout)
-	require.NoError(suite.T(), err)
-	assert.Len(suite.T(), added, 0)
-	assert.Len(suite.T(), modified, 0)
-
-	// We should get 2+0 events from initresversion
-	// apiserver does not send updates to objects if the add is in the same bucket
-	added, modified, _, err = suite.apiClient.LatestEvents(initresversion, eventReadTimeout)
+	added, resVer, lastList, err = suite.apiClient.RunEventCollection(resVer, lastList, eventReadTimeout, 100, 300, "")
 	require.NoError(suite.T(), err)
 	assert.Len(suite.T(), added, 2)
-	assert.Len(suite.T(), modified, 0)
+	assert.Equal(suite.T(), "tick", added[0].Reason)
+	assert.EqualValues(suite.T(), 2, added[0].Count)
+	assert.Equal(suite.T(), "tick", added[1].Reason)
+	assert.EqualValues(suite.T(), 3, added[1].Count)
+
+	// We should get nothing new now
+	added, resVer, lastList, err = suite.apiClient.RunEventCollection(resVer, lastList, eventReadTimeout, 100, 300, "")
+	require.NoError(suite.T(), err)
+	assert.Len(suite.T(), added, 0)
 }
 
 func (suite *testSuite) TestHostnameProvider() {
@@ -183,21 +179,21 @@ func (suite *testSuite) TestHostnameProvider() {
 	dummyPod := createPodOnNode("default", myHostname, "target.host")
 
 	// Register it in the apiserver
-	_, err = core.Pods("default").Create(dummyPod)
+	_, err = core.Pods("default").Create(context.TODO(), dummyPod, v1.CreateOptions{})
 	require.NoError(suite.T(), err)
-	defer core.Pods("default").Delete(myHostname, nil)
+	defer core.Pods("default").Delete(context.TODO(), myHostname, v1.DeleteOptions{})
 
 	// Hostname provider should return the expected value
-	foundHost, err := apiserver.HostnameProvider()
+	foundHost, err := hostname_apiserver.HostnameProvider()
 	assert.Equal(suite.T(), "target.host", foundHost)
 
 	// Testing hostname when a cluster name is set
-	var testClusterName = "Laika"
+	var testClusterName = "laika"
 	mockConfig.Set("cluster_name", testClusterName)
 	clustername.ResetClusterName()
 	defer mockConfig.Set("cluster_name", "")
 	defer clustername.ResetClusterName()
 
-	foundHost, err = apiserver.HostnameProvider()
-	assert.Equal(suite.T(), "target.host-Laika", foundHost)
+	foundHost, err = hostname_apiserver.HostnameProvider()
+	assert.Equal(suite.T(), "target.host-laika", foundHost)
 }

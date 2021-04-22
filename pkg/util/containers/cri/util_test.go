@@ -1,7 +1,7 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2016-2019 Datadog, Inc.
+// Copyright 2016-present Datadog, Inc.
 
 // +build cri
 
@@ -14,7 +14,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	fakeremote "k8s.io/kubernetes/pkg/kubelet/remote/fake"
+	fakeremote "k8s.io/kubernetes/pkg/kubelet/cri/remote/fake"
 )
 
 func TestCRIUtilInit(t *testing.T) {
@@ -31,8 +31,8 @@ func TestCRIUtilInit(t *testing.T) {
 	}
 	err = util.init()
 	require.NoError(t, err)
-	assert.Equal(t, "fakeRuntime", util.Runtime)
-	assert.Equal(t, "0.1.0", util.RuntimeVersion)
+	assert.Equal(t, "fakeRuntime", util.GetRuntime())
+	assert.Equal(t, "0.1.0", util.GetRuntimeVersion())
 }
 
 func TestCRIUtilListContainerStats(t *testing.T) {

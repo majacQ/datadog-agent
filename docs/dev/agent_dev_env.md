@@ -1,38 +1,77 @@
-# Setting up your development environment
+# Linux and MacOS Development Environments
 
 ## Python
 
-The Agent embeds a full-fledged CPython interpreter so it requires the development
-files to be available in the dev env.
+The Agent embeds a full-fledged CPython interpreter so it requires the
+development files to be available in the dev env. The Agent can embed Python2
+and/or Python3, you will need development files for all versions you want to
+support.
 
-If you're on OSX/macOS, installing Python 2.7 with [Homebrew](https://brew.sh) will
-bring along all the development files needed:
+If you're on OSX/macOS, installing Python 2.7 and/or 3.8 with [Homebrew](https://brew.sh)
+brings along all the development files needed:
+
+**Please note that not using Python versions explicitly supported, you may have
+problems running the built Agent's Python checks, especially if using a virtualenv.
+At this time, only Python 3.8 is confirmed to work as expected in the development
+environment.**
 ```
 brew install python@2
+brew install python@3.8
 ```
 
 On Linux, depending on the distribution, you might need to explicitly install
 the development files, for example on Ubuntu:
 ```
 sudo apt-get install python2.7-dev
+sudo apt-get install python3.8-dev
 ```
 
-On Windows, install Python 2.7 via the [official installer](https://www.python.org/downloads/).
+On Windows, install Python 2.7 and/or 3.8 via the [official installer](https://www.python.org/downloads/).
 
 ### Additional Windows Tools
 You will also need the Visual Studio for [Visual Studio for Python installer](http://aka.ms/vcpython27)
 
-Download the [gcc toolchain](http://win-builds.org/). 
-- From the graphical package manager, select and install the needed libraries, leave the default (select all) if you're unsure.  
-- Make sure to select x86_64. 
-- Add installation folder to the %PATH%.
+Download the [gcc toolchain](http://win-builds.org/).
+- From the graphical package manager, select and install the needed libraries, leave the default (select all) if you're unsure.
+- Make sure to select `x86_64`.
+- Add installation folder to the `%PATH%`.
 
 
-## Invoke + Python Dependencies
+### Python Dependencies
+
+#### Preface
+
+To protect and isolate your system-wide python installation, a python virtual
+environment is _highly_ recommended (though optional). It will help keep a
+self-contained development environment and ensure a clean system Python.
+
+**Please note that due to the [way
+some virtual environments handle executable paths](https://bugs.python.org/issue22213)
+(e.g. `python -m venv`), not all virtual environment options will be able to run the built
+agent correctly. At this time, the only confirmed virtual enviroment that is known for
+sure to work is `virtualenv`.**
+
+- Install the virtualenv module:
+`python3 -m pip install virtualenv`
+- Create the virtual environment:
+`virtualenv $GOPATH/src/github.com/DataDog/datadog-agent/venv`
+- [Activate the virtualenv](https://virtualenv.pypa.io/en/latest/user_guide.html#activators) (OS-dependent).
+  This must be done for every new terminal before you start.
+
+If using virtual environments when running the built Agent, you may need to override the built
+Agent's search path for Python check packages using the `PYTHONPATH` variable (your target path
+must have the [pre-requisite core integration packages installed](https://datadoghq.dev/integrations-core/setup/)
+though).
+```sh
+PYTHONPATH="./venv/lib/python3.8/site-packages:$PYTHONPATH" ./agent run ...
+```
+
+### Invoke
 
 [Invoke](http://www.pyinvoke.org/) is a task runner written in Python
 that is extensively used in this project to orchestrate builds and test
-runs.
+runs. Our invoke tasks are only compatible with Python 3, thus you will
+need to use Python 3 to run them.
 
 Though you may install invoke in a variety of way we suggest you use
 the provided [requirements](https://github.com/DataDog/datadog-agent/blob/master/requirements.txt)
@@ -42,50 +81,30 @@ file and `pip`:
 pip install -r requirements.txt
 ```
 
-This procedure ensures you not only get the correct version of invoke, but
+This procedure ensures you not only get the correct version of `invoke`, but
 also any additional python dependencies our development workflow may require,
 at their expected versions.
-It will also pull other handy development tools/deps (reno, or docker).
+It will also pull other handy development tools/deps (`reno`, or `docker`).
 
 Tasks are usually parameterized and Invoke comes with some default values that
 are used in the official build. Such values are listed in the `invoke.yaml`
 file at the root of this repo and can be overridden by setting `INVOKE_*` env
 variables (see Invoke docs for more details).
 
-
-### Note
-
-We don't want to pollute your system-wide python installation, so a python 2.7 virtual
-environment is recommended (though optional). It will help keep an isolated development
-environment and ensure a clean system python.
-
-- Install the virtualenv module:
-```pip install virtualenv```
-- Create the virtual environment:
-```virtualenv $GOPATH/src/github.com/DataDog/datadog-agent/venv```
-- Enable the virtual environment:
-```source $GOPATH/src/github.com/DataDog/datadog-agent/venv/bin/activate```
-
-
 ## Golang
 
-You must install [go](https://golang.org/doc/install) version 1.11.5 or above. Make
-sure that `$GOPATH/bin` is in your `$PATH` otherwise Invoke cannot use any
+You must [install Golang](https://golang.org/doc/install) version `1.15`. Make
+sure that `$GOPATH/bin` is in your `$PATH` otherwise `invoke` cannot use any
 additional tool it might need.
+
+**Please note that versions of Golang that aren't an exact match to the version
+specified in our build images (see e.g. [here](https://github.com/DataDog/datadog-agent/blob/master/.circleci/images/builder/Dockerfile#L1))
+may not be able to build the agent and/or the [rtloader](https://github.com/DataDog/datadog-agent/tree/master/rtloader)
+binary properly.**
 
 ## Installing dependencies
 
-From the root of `datadog-agent`, run `invoke deps`. This will:
-
-- Use `go` to install the necessary dependencies
-- Use `git` to clone [integrations-core][integrations-core]
-- Use `pip` to install [datadog_checks_base][datadog_checks_base]
-
-If you already installed [datadog_checks_base][datadog_checks_base] in your desired
-Python, you can do `invoke deps --no-checks` to prevent cloning and pip install. If
-you are already doing development on [integrations-core][integrations-core], you
-can specify a path to [integrations-core][integrations-core] using the `--core-dir`
-option or `DD_CORE_DIR` environment variable to omit just the cloning step.
+From the root of `datadog-agent`, run `invoke install-tools` to install go tooling, then `invoke deps` to install go dependencies. This uses `go` to install the necessary dependencies.
 
 ## System or Embedded?
 
@@ -132,30 +151,6 @@ boolean flag value to _false_, either exporting the env var `INVOKE_USE_SYSTEM_L
 changing the `invoke.yaml` file or passing the corresponding arg to the build and
 test tasks, like `invoke build --use-system-libs=false`.
 
-
-### SNMP (Simple Network Management Protocol)
-
-The new SNMP check is written in Go, so the Agent must be built against few
-libraries.
-
-On OSX/macOS with [Homebrew](https://brew.sh):
-```
-brew install net-snmp
-```
-
-On Windows TODO
-
-On Ubuntu:
-```
-sudo apt-get install libsnmp-base libsnmp-dev snmp-mibs-downloader
-```
-
-**Please note:** the package `snmp-mibs-downloader` is only available in the
-`multiverse` Ubuntu repo and in `non-free` Debian repo. If you don't really
-need to work/debug on the SNMP integration, you could just build the agent without
-it (see [Building the Agent][building] for how to do it) and avoid the dependencies
-setup efforts altogether.
-
 ### Systemd
 
 The agent is able to collect systemd journal logs using a wrapper on the systemd utility library.
@@ -182,3 +177,57 @@ dev environment.
 [agent-omnibus]: agent_omnibus.md
 [integrations-core]: https://github.com/DataDog/integrations-core
 [datadog_checks_base]: https://github.com/DataDog/integrations-core/tree/master/datadog_checks_base
+
+## Doxygen
+
+We use [Doxygen](http://www.doxygen.nl/) to generate the documentation for the `rtloader` part of the Agent.
+
+To generate it (using the `invoke rtloader.generate-doc` command), you'll need to have Doxygen installed on your system and available in your `$PATH`. You can compile and install Doxygen from source with the instructions available [here](http://www.doxygen.nl/manual/install.html).
+Alternatively, you can use already-compiled Doxygen binaries from [here](http://www.doxygen.nl/download.html).
+
+To get the dependency graphs, you may also need to install the `dot` executable from [graphviz](http://www.graphviz.org/) and add it to your `$PATH`.
+
+## Pre-commit hooks
+
+It is optional but recommended to install `pre-commit` to run a number of checks done by the CI locally.
+
+### Installation
+
+To install it, run:
+
+```sh
+python3 -m pip install pre-commit
+pre-commit install
+```
+
+The `shellcheck` pre-commit hook requires having the `shellcheck` binary installed and in your `$PATH`.
+To install it, run:
+
+```sh
+inv install-shellcheck --destination <path>
+```
+
+(by default, the shellcheck binary is installed in `/usr/local/bin`).
+
+### Skipping `pre-commit`
+
+If you want to skip `pre-commit` for a specific commit you can add `--no-verify` to the `git commit` command.
+
+### Running `pre-commit` manually
+
+If you want to run one of the checks manually, you can run `pre-commit run <check name>`.
+
+You can run it on all files with the `--all-files` flag.
+```sh
+pre-commit run flake8 --all-files  # run flake8 on all files
+```
+
+See `pre-commit run --help` for further options.
+
+# Setting up your Windows development environment
+
+## Code editor
+
+[Microsoft Visual Studio Code](https://code.visualstudio.com/download) is recommended as it's lightweight and versatile.
+
+Building on Windows would require multiple 3rd-party softwares to be installed. To avoid the complexity, it is recommended to make the code change in VS Code then do the build in Docker image. For complete information, see [Build the Agent packages](https://github.com/DataDog/datadog-agent/blob/master/docs/dev/agent_omnibus.md)

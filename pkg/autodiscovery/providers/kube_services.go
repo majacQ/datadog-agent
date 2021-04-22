@@ -1,7 +1,7 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2016-2019 Datadog, Inc.
+// Copyright 2016-present Datadog, Inc.
 
 // +build clusterchecks
 // +build kubeapiserver
@@ -18,6 +18,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 
 	"github.com/DataDog/datadog-agent/pkg/autodiscovery/integration"
+	"github.com/DataDog/datadog-agent/pkg/autodiscovery/providers/names"
 	"github.com/DataDog/datadog-agent/pkg/config"
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes/apiserver"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
@@ -26,24 +27,23 @@ import (
 const (
 	// AD on the load-balanced service IPs
 	kubeServiceAnnotationPrefix = "ad.datadoghq.com/service."
-	// AD on the individual service endpoints (TODO)
-	kubeEndpointAnnotationPrefix = "ad.datadoghq.com/endpoints."
-	kubeEndpointIDPrefix         = "kube_endpoint://"
 )
 
-// KubeletConfigProvider implements the ConfigProvider interface for the kubelet.
+// KubeServiceConfigProvider implements the ConfigProvider interface for the apiserver.
 type KubeServiceConfigProvider struct {
 	lister   listersv1.ServiceLister
 	upToDate bool
 }
 
-// NewKubeServiceConfigProvider returns a new ConfigProvider connected to kubelet.
+// NewKubeServiceConfigProvider returns a new ConfigProvider connected to apiserver.
 // Connectivity is not checked at this stage to allow for retries, Collect will do it.
 func NewKubeServiceConfigProvider(config config.ConfigurationProviders) (ConfigProvider, error) {
+	// Using GetAPIClient() (no retry)
 	ac, err := apiserver.GetAPIClient()
 	if err != nil {
 		return nil, fmt.Errorf("cannot connect to apiserver: %s", err)
 	}
+
 	servicesInformer := ac.InformerFactory.Core().V1().Services()
 	if servicesInformer == nil {
 		return nil, fmt.Errorf("cannot get service informer: %s", err)
@@ -64,7 +64,7 @@ func NewKubeServiceConfigProvider(config config.ConfigurationProviders) (ConfigP
 
 // String returns a string representation of the KubeServiceConfigProvider
 func (k *KubeServiceConfigProvider) String() string {
-	return KubeServices
+	return names.KubeServices
 }
 
 // Collect retrieves services from the apiserver, builds Config objects and returns them
@@ -115,11 +115,6 @@ func (k *KubeServiceConfigProvider) invalidateIfChanged(old, obj interface{}) {
 		k.upToDate = false
 		return
 	}
-	if valuesDiffer(castedObj.Annotations, castedOld.Annotations, kubeEndpointAnnotationPrefix) {
-		log.Trace("Invalidating configs on service end annotations change")
-		k.upToDate = false
-		return
-	}
 }
 
 // valuesDiffer returns true if the annotations matching the
@@ -155,24 +150,19 @@ func parseServiceAnnotations(services []*v1.Service) ([]integration.Config, erro
 			log.Debug("Ignoring a nil service")
 			continue
 		}
-		service_id := apiserver.EntityForService(svc)
-		svcConf, errors := extractTemplatesFromMap(service_id, svc.Annotations, kubeServiceAnnotationPrefix)
+		serviceID := apiserver.EntityForService(svc)
+		svcConf, errors := extractTemplatesFromMap(serviceID, svc.Annotations, kubeServiceAnnotationPrefix)
 		for _, err := range errors {
 			log.Errorf("Cannot parse service template for service %s/%s: %s", svc.Namespace, svc.Name, err)
 		}
-		endptConf, errors := extractTemplatesFromMap(apiserver.EntityForEndpoints(svc.Namespace, svc.Name), svc.Annotations, kubeEndpointAnnotationPrefix)
-		for _, err := range errors {
-			log.Errorf("Cannot parse endpoint template for service %s/%s: %s", svc.Namespace, svc.Name, err)
-		}
+		ignoreADTags := ignoreADTagsFromAnnotations(svc.GetAnnotations(), kubeServiceAnnotationPrefix)
 		// All configurations are cluster checks
 		for i := range svcConf {
 			svcConf[i].ClusterCheck = true
-		}
-		for i := range endptConf {
-			endptConf[i].ClusterCheck = true
+			svcConf[i].Source = "kube_services:" + serviceID
+			svcConf[i].IgnoreAutodiscoveryTags = ignoreADTags
 		}
 		configs = append(configs, svcConf...)
-		configs = append(configs, endptConf...)
 	}
 
 	return configs, nil

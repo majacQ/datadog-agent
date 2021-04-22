@@ -1,7 +1,7 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
-// Copyright 2016-2019 Datadog, Inc.
+// Copyright 2016-present Datadog, Inc.
 
 package scheduler
 
@@ -9,12 +9,20 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/DataDog/datadog-agent/pkg/autodiscovery/integration"
-	"github.com/DataDog/datadog-agent/pkg/autodiscovery/providers"
-	"github.com/DataDog/datadog-agent/pkg/logs/service"
-	"github.com/DataDog/datadog-agent/pkg/util/log"
+	yaml "gopkg.in/yaml.v2"
 
+	"github.com/DataDog/datadog-agent/pkg/autodiscovery/integration"
+	"github.com/DataDog/datadog-agent/pkg/autodiscovery/providers/names"
 	logsConfig "github.com/DataDog/datadog-agent/pkg/logs/config"
+	"github.com/DataDog/datadog-agent/pkg/logs/service"
+	"github.com/DataDog/datadog-agent/pkg/util/containers"
+	"github.com/DataDog/datadog-agent/pkg/util/log"
+)
+
+var (
+	// scheduler is plugged to autodiscovery to collect integration configs
+	// and schedule log collection for different kind of inputs
+	adScheduler *Scheduler
 )
 
 // Scheduler creates and deletes new sources and services to start or stop
@@ -27,16 +35,18 @@ type Scheduler struct {
 	services *service.Services
 }
 
-// NewScheduler returns a new scheduler.
-func NewScheduler(sources *logsConfig.LogSources, services *service.Services) *Scheduler {
-	return &Scheduler{
+// CreateScheduler creates the scheduler.
+func CreateScheduler(sources *logsConfig.LogSources, services *service.Services) {
+	adScheduler = &Scheduler{
 		sources:  sources,
 		services: services,
 	}
 }
 
 // Stop does nothing.
-func (s *Scheduler) Stop() {}
+func (s *Scheduler) Stop() {
+	adScheduler = nil
+}
 
 // Schedule creates new sources and services from a list of integration configs.
 // An integration config can be mapped to a list of sources when it contains a Provider,
@@ -44,7 +54,11 @@ func (s *Scheduler) Stop() {}
 // An entity represents a unique identifier for a process that be reused to query logs.
 func (s *Scheduler) Schedule(configs []integration.Config) {
 	for _, config := range configs {
-		if !s.isLogConfig(config) {
+		if !config.IsLogConfig() {
+			continue
+		}
+		if config.HasFilter(containers.LogsFilter) {
+			log.Debugf("Config %s is filtered out for logs collection, ignoring it", s.configName(config))
 			continue
 		}
 		switch {
@@ -59,6 +73,15 @@ func (s *Scheduler) Schedule(configs []integration.Config) {
 				s.sources.AddSource(source)
 			}
 		case s.newService(config):
+			entityType, _, err := s.parseEntity(config.TaggerEntity)
+			if err != nil {
+				log.Warnf("Invalid service: %v", err)
+				continue
+			}
+			// logs only consider container services
+			if entityType != containers.ContainerEntityName {
+				continue
+			}
 			log.Infof("Received a new service: %v", config.Entity)
 			service, err := s.toService(config)
 			if err != nil {
@@ -76,7 +99,7 @@ func (s *Scheduler) Schedule(configs []integration.Config) {
 // Unschedule removes all the sources and services matching the integration configs.
 func (s *Scheduler) Unschedule(configs []integration.Config) {
 	for _, config := range configs {
-		if !s.isLogConfig(config) {
+		if !config.IsLogConfig() || config.HasFilter(containers.LogsFilter) {
 			continue
 		}
 		switch {
@@ -88,7 +111,6 @@ func (s *Scheduler) Unschedule(configs []integration.Config) {
 				log.Warnf("Invalid configuration: %v", err)
 				continue
 			}
-
 			for _, source := range s.sources.GetSources() {
 				if identifier == source.Config.Identifier {
 					s.sources.RemoveSource(source)
@@ -96,6 +118,15 @@ func (s *Scheduler) Unschedule(configs []integration.Config) {
 			}
 		case s.newService(config):
 			// new service to remove
+			entityType, _, err := s.parseEntity(config.TaggerEntity)
+			if err != nil {
+				log.Warnf("Invalid service: %v", err)
+				continue
+			}
+			// logs only consider container services
+			if entityType != containers.ContainerEntityName {
+				continue
+			}
 			log.Infof("New service to remove: entity: %v", config.Entity)
 			service, err := s.toService(config)
 			if err != nil {
@@ -108,11 +139,6 @@ func (s *Scheduler) Unschedule(configs []integration.Config) {
 			continue
 		}
 	}
-}
-
-// isLogConfig returns true if config contains a logs config.
-func (s *Scheduler) isLogConfig(config integration.Config) bool {
-	return config.LogsConfig != nil
 }
 
 // newSources returns true if the config can be mapped to sources.
@@ -144,10 +170,10 @@ func (s *Scheduler) toSources(config integration.Config) ([]*logsConfig.LogSourc
 	var err error
 
 	switch config.Provider {
-	case providers.File:
+	case names.File:
 		// config defined in a file
 		configs, err = logsConfig.ParseYAML(config.LogsConfig)
-	case providers.Docker, providers.Kubernetes:
+	case names.Docker, names.Kubernetes:
 		// config attached to a docker label or a pod annotation
 		configs, err = logsConfig.ParseJSON(config.LogsConfig)
 	default:
@@ -159,6 +185,15 @@ func (s *Scheduler) toSources(config integration.Config) ([]*logsConfig.LogSourc
 	}
 
 	var service *service.Service
+
+	commonGlobalOptions := integration.CommonGlobalConfig{}
+	err = yaml.Unmarshal(config.InitConfig, &commonGlobalOptions)
+	if err != nil {
+		return nil, fmt.Errorf("invalid init_config section for source %s: %s", config.Name, err)
+	}
+
+	globalServiceDefined := commonGlobalOptions.Service != ""
+
 	if config.Entity != "" {
 		// all configs attached to a docker label or a pod annotation contains an entity;
 		// this entity is used later on by an input to match a service with a source
@@ -173,11 +208,22 @@ func (s *Scheduler) toSources(config integration.Config) ([]*logsConfig.LogSourc
 	configName := s.configName(config)
 	var sources []*logsConfig.LogSource
 	for _, cfg := range configs {
+		// if no service is set fall back to the global one
+		if cfg.Service == "" && globalServiceDefined {
+			cfg.Service = commonGlobalOptions.Service
+		}
+
 		if service != nil {
 			// a config defined in a docker label or a pod annotation does not always contain a type,
 			// override it here to ensure that the config won't be dropped at validation.
-			cfg.Type = service.Type
-			cfg.Identifier = service.Identifier // used for matching a source with a service
+			if cfg.Type == logsConfig.FileType && (config.Provider == names.Kubernetes || config.Provider == names.Docker) {
+				// cfg.Type is not overwritten as tailing a file from a Docker or Kubernetes AD configuration
+				// is explicitly supported (other combinations may be supported later)
+				cfg.Identifier = service.Identifier
+			} else {
+				cfg.Type = service.Type
+				cfg.Identifier = service.Identifier // used for matching a source with a service
+			}
 		}
 
 		source := logsConfig.NewLogSource(configName, cfg)
@@ -198,19 +244,12 @@ func (s *Scheduler) toService(config integration.Config) (*service.Service, erro
 	if err != nil {
 		return nil, err
 	}
-	switch provider {
-	case service.Docker:
-		return service.NewService(provider, identifier, s.getCreationTime(config)), nil
-	case service.Containerd:
-		return service.NewService(provider, identifier, s.getCreationTime(config)), nil
-	default:
-		return nil, fmt.Errorf("%v is not supported yet", provider)
-	}
+	return service.NewService(provider, identifier, s.getCreationTime(config)), nil
 }
 
 // parseEntity breaks down an entity into a service provider and a service identifier.
 func (s *Scheduler) parseEntity(entity string) (string, string, error) {
-	components := strings.Split(entity, "://")
+	components := strings.Split(entity, containers.EntitySeparator)
 	if len(components) != 2 {
 		return "", "", fmt.Errorf("entity is malformed : %v", entity)
 	}
@@ -226,4 +265,9 @@ var integrationToServiceCRTime = map[integration.CreationTime]service.CreationTi
 // getCreationTime returns the service creation time for the integration configuration.
 func (s *Scheduler) getCreationTime(config integration.Config) service.CreationTime {
 	return integrationToServiceCRTime[config.CreationTime]
+}
+
+// GetScheduler returns the logs-config scheduler if set.
+func GetScheduler() *Scheduler {
+	return adScheduler
 }
